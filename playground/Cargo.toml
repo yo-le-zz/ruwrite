@@ -1,0 +1,11 @@
+[package]
+name = "ruwrite-playground"
+version = "0.1.0"
+edition = "2021"
+authors = ["yolezz"]
+description = "Target programs and end-to-end tests for ruwrite."
+license = "MIT"
+publish = false
+
+[dependencies]
+ruwrite = { path = ".." }

@@ -84,6 +84,7 @@ Names can be given in full (`demo::compute`) or by their last segments
 | `exe.set_static("NAME", 5)` | new value of a scalar `static` (width and signedness taken from the variable) |
 | `exe.set_static_bytes("NAME", b"...")` | new contents of a `static` of any type (arrays, structs) |
 | `exe.local("fn", "var")?.set(2u8)` | initial value of a local variable |
+| `exe.local("fn", "var")?.assign_at(addr, 7)` | new assignment inserted in freed space; only for `mut` variables (see below) |
 | `exe.function("f")?.returns(true)` | the function immediately returns this value |
 | `exe.function("f")?.disable()` | the function immediately returns (`()`) |
 | `exe.function("f")?.redirect_to("g")` | calls to `f` run `g` |
@@ -103,6 +104,28 @@ Names can be given in full (`demo::compute`) or by their last segments
 
 Hot and file commits combine: `commit_hot(pid)` then `commit()` makes the
 change permanent as well.
+
+### Mutability guard
+
+DWARF does not say whether a variable is `mut`, so ruwrite reads the
+declaration line in the program's source (`let a` vs `let mut a`). Rewriting
+the **initial value** (`set`) is always allowed: that is the initialiser.
+Adding a **later assignment** (`assign_at`) to a variable declared with a
+plain `let` is refused, because the result would not be valid Rust:
+
+```rust
+exe.set_source_root("path/to/program/src");     // if the recorded path moved
+let local = exe.local("counter", "fixed")?;
+assert_eq!(local.mutability(), Mutability::Immutable);
+local.assign_at(addr, 1)?;                      // Err(NotMutable)
+
+// Your call: explicitly treat it as `mut`.
+exe.local("counter", "fixed")?.make_mut().assign_at(addr, 1)?;
+```
+
+When the source cannot be found the status is `Unknown`, which is treated as
+not mutable. `assign_at` needs padding at `addr`: free the bytes first with
+`exe.nop(addr, n)` and `commit()`.
 
 ## Try it
 
@@ -139,6 +162,10 @@ has honest limits:
 - **Zero-initialised statics** (`.bss`) have no bytes in the file and cannot be
   rewritten; they are reported with an explicit error. A plain `static X: i32 = 0`
   falls in this category.
+- **No code re-optimisation.** ruwrite does not regenerate or optimise code
+  around an edit: it writes small fixed-size sequences (a store, a return, a
+  jump) where space exists. Growing a function or restructuring its body is
+  done by supplying your own bytes with `replace_code`.
 - **Function rewrites must fit** in the symbol's size (`returns(true)` needs 3
   bytes, an `f64` constant 16). `returns` on a 32-bit x86 float is unsupported.
 - **Hot patching** is Linux only, needs ptrace rights on the target (same user,

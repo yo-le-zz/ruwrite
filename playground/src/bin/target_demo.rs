@@ -30,6 +30,13 @@ fn small_local() -> i64 {
 }
 
 #[inline(never)]
+fn counter() -> i32 {
+    let mut c: i32 = 1;
+    let fixed: i32 = 5;
+    *black_box(&mut c) + *black_box(&fixed)
+}
+
+#[inline(never)]
 fn is_admin() -> bool {
     false
 }
@@ -67,6 +74,7 @@ fn main() {
     println!("small={}", black_box(&SMALL));
     println!("compute={}", compute());
     println!("small_local={}", small_local());
+    println!("counter={}", counter());
     println!("admin={}", is_admin());
     println!("scale={}", scale());
     say_hi();

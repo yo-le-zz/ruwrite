@@ -28,7 +28,8 @@ fails with `BytesMismatch` instead of corrupting a binary.
 | `edit.rs` | `FunctionEditor` and `LocalEditor` |
 | `dwarf.rs` | DWARF reader: functions, statics, locals, type sizes, line table |
 | `code.rs` | machine-code generation (x86, x86_64, aarch64) |
-| `x86.rs` | finds `mov [mem], imm` stores in x86 code |
+| `x86.rs` | finds and encodes `mov [mem], imm` stores in x86 code |
+| `mutability.rs` | `let` / `let mut` detection from the source |
 | `patch.rs` | `Patch` and the all-or-nothing `PatchSet` |
 | `live.rs` | hot patching through `/proc/<pid>/mem` |
 | `value.rs` | `Value`: scalar encoding/decoding and range checks |
@@ -46,6 +47,12 @@ computes the stack slot from DWARF (`DW_OP_fbreg` + frame base), scans the
 function's code for a store of an immediate into exactly that slot with the
 same width, and rewrites the immediate. If several stores match, the line
 table and the declaration line pick the right one.
+
+**Mutability** (`mutability`, `make_mut`, `assign_at`). `DW_AT_decl_file` and
+`DW_AT_decl_line` locate the `let` of a variable; `mutability.rs` classifies the
+pattern (`let mut a`, `let (mut x, y)`). `assign_at` refuses non-`mut`
+variables unless `make_mut` was called, then writes a `mov [slot], imm`
+encoded like the compiler's (disp8 when it fits) into existing padding.
 
 **Functions** (`returns`, `disable`, `redirect_to`, `replace_code`). The new
 code is written at the start of the function; it must fit in the symbol's

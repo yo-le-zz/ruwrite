@@ -100,6 +100,63 @@ fn signed_displacement(raw: u64, bitness: u32) -> i64 {
     }
 }
 
+/// Encode `mov <size> ptr [base + disp], imm` for a stack-slot base register.
+///
+/// `value` holds the little-endian bytes of the stored value (1, 2, 4 or 8
+/// bytes). An 8-byte store only has a sign-extended 32-bit immediate, so the
+/// value must fit; otherwise `None` is returned (as for an unsupported base).
+pub fn encode_store(base: Register, disp: i32, value: &[u8]) -> Option<Vec<u8>> {
+    let rm = match base {
+        Register::RSP | Register::ESP => 4u8,
+        Register::RBP | Register::EBP => 5u8,
+        _ => return None,
+    };
+    let wide = base.is_gpr64();
+    let mut code = Vec::new();
+    let imm: &[u8] = match value.len() {
+        1 => {
+            code.push(0xC6);
+            value
+        }
+        2 => {
+            code.extend([0x66, 0xC7]);
+            value
+        }
+        4 => {
+            code.push(0xC7);
+            value
+        }
+        8 if wide => {
+            let low = i32::from_le_bytes(value[..4].try_into().ok()?);
+            let full = i64::from_le_bytes(value.try_into().ok()?);
+            if i64::from(low) != full {
+                return None;
+            }
+            code.extend([0x48, 0xC7]);
+            &value[..4]
+        }
+        _ => return None,
+    };
+    // Déplacement sur 1 octet quand il tient : même taille que le compilateur.
+    let short = i8::try_from(disp).ok();
+    code.push(
+        if short.is_some() {
+            0b0100_0000
+        } else {
+            0b1000_0000
+        } | rm,
+    ); // reg=/0
+    if rm == 4 {
+        code.push(0x24); // SIB : base=rsp/esp, sans index
+    }
+    match short {
+        Some(d) => code.push(d as u8),
+        None => code.extend(disp.to_le_bytes()),
+    }
+    code.extend(imm);
+    Some(code)
+}
+
 /// Register used as DWARF frame base, translated to an iced register.
 pub fn frame_register(dwarf_reg: u16, bitness: u32) -> Option<Register> {
     match (bitness, dwarf_reg) {
@@ -161,6 +218,32 @@ mod tests {
             0xB8, 0x03, 0x00, 0x00, 0x00, 0x8B, 0x44, 0x24, 0x04, 0x89, 0x44, 0x24, 0x04,
         ];
         assert!(scan_imm_stores(&code, 0, 64).is_empty());
+    }
+
+    #[test]
+    fn encoded_stores_decode_back_to_the_same_slot() {
+        let cases: [(Register, i32, &[u8]); 4] = [
+            (Register::RSP, 0x14, &[9, 0, 0, 0]),
+            (Register::RBP, -4, &[2]),
+            (
+                Register::RSP,
+                8,
+                &[0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF],
+            ),
+            (Register::RSP, 0x100, &[0x34, 0x12]),
+        ];
+        for (base, disp, value) in cases {
+            let code = encode_store(base, disp, value).unwrap();
+            let stores = scan_imm_stores(&code, 0, 64);
+            assert_eq!(stores.len(), 1, "{code:02x?}");
+            assert_eq!(stores[0].base, base);
+            assert_eq!(stores[0].disp, i64::from(disp));
+            assert_eq!(stores[0].mem_size, value.len());
+            assert_eq!(stores[0].offset, 0);
+        }
+        assert!(encode_store(Register::RSP, 0, &[0; 8]).is_some());
+        assert!(encode_store(Register::RSP, 0, &[0, 0, 0, 0x80, 0, 0, 0, 0]).is_none());
+        assert!(encode_store(Register::RAX, 0, &[1]).is_none());
     }
 
     #[test]

@@ -35,6 +35,8 @@ pub struct DwLocal {
     /// Offset from the frame base (`DW_OP_fbreg`).
     pub frame_offset: i64,
     pub decl_line: Option<u32>,
+    /// Source file of the declaration, as recorded by the compiler.
+    pub decl_file: Option<String>,
 }
 
 /// A function described by DWARF.
@@ -282,11 +284,13 @@ fn read_variable<'a>(
                     .attr_value(gimli::DW_AT_decl_line)
                     .and_then(|v| v.udata_value())
                     .and_then(|v| u32::try_from(v).ok());
+                let decl_file = declaration_file(dwarf, unit, entry)?;
                 info.functions[idx].locals.push(DwLocal {
                     name,
                     ty,
                     frame_offset: offset,
                     decl_line,
+                    decl_file,
                 });
             }
         }
@@ -424,4 +428,48 @@ fn array_type<'a>(
         class: Class::Other,
         size: element.size * count,
     })
+}
+
+/// Chemin du fichier source où la variable est déclarée (`DW_AT_decl_file`).
+fn declaration_file<'a>(
+    dwarf: &Dwarf<'a>,
+    unit: &Unit<'a>,
+    entry: &Entry<'a>,
+) -> gimli::Result<Option<String>> {
+    let Some(AttributeValue::FileIndex(index)) = entry.attr_value(gimli::DW_AT_decl_file) else {
+        return Ok(None);
+    };
+    let Some(program) = unit.line_program.as_ref() else {
+        return Ok(None);
+    };
+    let header = program.header();
+    let Some(file) = header.file(index) else {
+        return Ok(None);
+    };
+    let name = dwarf
+        .attr_string(unit, file.path_name())?
+        .to_string_lossy()
+        .into_owned();
+    if name.starts_with('/') {
+        return Ok(Some(name));
+    }
+    let mut path = String::new();
+    if let Some(dir) = file.directory(header) {
+        path.push_str(&dwarf.attr_string(unit, dir)?.to_string_lossy());
+    }
+    if !path.starts_with('/') {
+        if let Some(comp_dir) = &unit.comp_dir {
+            let base = comp_dir.to_string_lossy().into_owned();
+            path = if path.is_empty() {
+                base
+            } else {
+                format!("{base}/{path}")
+            };
+        }
+    }
+    if !path.is_empty() && !path.ends_with('/') {
+        path.push('/');
+    }
+    path.push_str(&name);
+    Ok(Some(path))
 }

@@ -1,5 +1,6 @@
 //! The [`Executable`] type: loading, inspection, edits and `commit`.
 
+use std::collections::HashSet;
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -110,6 +111,8 @@ pub struct Executable {
     debug: OnceLock<std::result::Result<DebugInfo, String>>,
     pending: PatchSet,
     backup: bool,
+    source_root: Option<PathBuf>,
+    forced_mut: HashSet<(String, String)>,
 }
 
 impl fmt::Debug for Executable {
@@ -158,6 +161,8 @@ impl Executable {
             debug: OnceLock::new(),
             pending: PatchSet::default(),
             backup: true,
+            source_root: None,
+            forced_mut: HashSet::new(),
         })
     }
 
@@ -557,6 +562,35 @@ impl Executable {
     /// Drops every queued edit.
     pub fn discard(&mut self) {
         self.pending.clear();
+    }
+
+    /// Directory holding the program's source code.
+    ///
+    /// Used to find out whether a local variable is declared `mut` (see
+    /// [`LocalEditor::mutability`](crate::LocalEditor::mutability)). The
+    /// compiler's recorded path is tried first, then the end of that path
+    /// joined to this directory.
+    pub fn set_source_root(&mut self, root: impl Into<PathBuf>) -> &mut Self {
+        self.source_root = Some(root.into());
+        self
+    }
+
+    pub(crate) fn source_root(&self) -> Option<&Path> {
+        self.source_root.as_deref()
+    }
+
+    pub(crate) fn is_forced_mut(&self, function: &str, variable: &str) -> bool {
+        self.forced_mut
+            .contains(&(function.to_string(), variable.to_string()))
+    }
+
+    pub(crate) fn force_mut(&mut self, function: &str, variable: &str) {
+        self.forced_mut
+            .insert((function.to_string(), variable.to_string()));
+    }
+
+    pub(crate) fn code_bytes(&self, address: u64, len: usize) -> Result<&[u8]> {
+        self.read_bytes(address, len)
     }
 
     /// Enables or disables the `<file>.orig` backup made by [`commit`](Self::commit)

@@ -9,7 +9,7 @@ use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
-use ruwrite::{Error, Executable, Value};
+use ruwrite::{Error, Executable, Mutability, Value};
 
 const TARGET: &str = env!("CARGO_BIN_EXE_target_demo");
 const HOT: &str = env!("CARGO_BIN_EXE_hot_demo");
@@ -374,4 +374,67 @@ fn hot_patch_of_the_wrong_binary_is_refused() {
         err,
         Err(Error::Live(_) | Error::BytesMismatch { .. })
     ));
+}
+
+#[test]
+fn mutability_is_read_from_the_source() {
+    let t = Copy::of(TARGET);
+    let mut exe = t.open();
+    assert_eq!(
+        exe.local("counter", "c").unwrap().mutability(),
+        Mutability::Mutable
+    );
+    assert_eq!(
+        exe.local("counter", "fixed").unwrap().mutability(),
+        Mutability::Immutable
+    );
+}
+
+#[test]
+fn assigning_an_immutable_variable_is_refused_until_made_mut() {
+    let t = Copy::of(TARGET);
+    let mut exe = t.open();
+    let err = exe.local("counter", "fixed").unwrap().assign_at(0, 1);
+    assert!(matches!(err, Err(Error::NotMutable { .. })), "{err:?}");
+    assert!(exe.pending().is_empty());
+
+    // Une fois autorisé explicitement, c'est l'emplacement qui est vérifié :
+    // l'adresse 0 n'est pas dans la fonction.
+    let err = exe
+        .local("counter", "fixed")
+        .unwrap()
+        .make_mut()
+        .assign_at(0, 1);
+    assert!(matches!(err, Err(Error::LocalPatch(_))), "{err:?}");
+}
+
+#[test]
+fn inserts_an_assignment_into_freed_space() {
+    let t = Copy::of(TARGET);
+
+    // 1. On libère la place de `c = 1` (le store initial) et on valide.
+    let mut exe = t.open();
+    let lines = exe.function("counter").unwrap().disassemble().unwrap();
+    let at = lines
+        .iter()
+        .position(|(_, text)| text.contains("dword ptr") && text.ends_with(",1"))
+        .expect("store of c");
+    let (address, next) = (lines[at].0, lines[at + 1].0);
+    exe.nop(address, (next - address) as usize).unwrap();
+    exe.commit().unwrap();
+    assert_ne!(t.run()["counter"], "6"); // `c` n'est plus initialisée à 1
+
+    // 2. `c` est `mut` : l'assignation est acceptée et réinsérée à cet endroit.
+    let mut exe = t.open();
+    exe.local("counter", "c")
+        .unwrap()
+        .assign_at(address, 10)
+        .unwrap();
+    exe.commit().unwrap();
+    assert_eq!(t.run()["counter"], "15"); // 10 + 5
+
+    // 3. `fixed` n'est pas `mut` : refus, sauf décision explicite.
+    let mut exe = t.open();
+    let err = exe.local("counter", "fixed").unwrap().assign_at(address, 1);
+    assert!(matches!(err, Err(Error::NotMutable { .. })));
 }

@@ -20,6 +20,7 @@ use crate::code;
 use crate::dwarf::{DwFunction, DwLocal, FrameBase};
 use crate::error::{Error, Result};
 use crate::exe::{Executable, Function};
+use crate::mutability::{self, Mutability};
 use crate::value::Value;
 use crate::x86::{self, ImmStore};
 
@@ -185,6 +186,119 @@ impl<'a> LocalEditor<'a> {
         self.apply(value.into(), true)
     }
 
+    /// Whether the variable is declared `mut`, read from its declaration line.
+    ///
+    /// `Unknown` when the source file cannot be found (see
+    /// [`Executable::set_source_root`]); it is then treated as not mutable.
+    pub fn mutability(&self) -> Mutability {
+        self.declared_mutability().0
+    }
+
+    /// Mutability as declared in the source, with an explanation.
+    fn declared_mutability(&self) -> (Mutability, String) {
+        let local = &self.locals[0];
+        let (Some(file), Some(line)) = (&local.decl_file, local.decl_line) else {
+            return (
+                Mutability::Unknown,
+                "no declaration in the debug info".into(),
+            );
+        };
+        match mutability::read_source(file, self.exe.source_root()) {
+            Some(text) => {
+                let found = mutability::classify(&text, line, &local.name);
+                let why = match found {
+                    Mutability::Mutable => format!("declared with `let mut` at {file}:{line}"),
+                    Mutability::Immutable => {
+                        format!("declared with a plain `let` at {file}:{line}")
+                    }
+                    Mutability::Unknown => format!("declaration at {file}:{line} not recognised"),
+                };
+                (found, why)
+            }
+            None => (
+                Mutability::Unknown,
+                format!("source file `{file}` not found; use `set_source_root`"),
+            ),
+        }
+    }
+
+    /// Explicitly allows later modifications of this variable, as if it were
+    /// declared `mut`. The decision is yours: ruwrite only enforces that it
+    /// is taken on purpose.
+    pub fn make_mut(self) -> Self {
+        self.exe
+            .force_mut(&self.function.name, &self.locals[0].name);
+        self
+    }
+
+    /// Inserts `variable = value;` at `address`, a place where the original
+    /// code has only padding (`nop` / `int3`).
+    ///
+    /// Unlike [`set`](Self::set), which rewrites the initialiser, this adds a
+    /// **new assignment**, so it is only accepted for a variable declared
+    /// `mut` in the source or made mutable with [`make_mut`](Self::make_mut);
+    /// otherwise [`Error::NotMutable`] is returned. To free a spot, queue and
+    /// commit [`Executable::nop`] on instructions you decide to drop.
+    pub fn assign_at(self, address: u64, value: impl Into<Value>) -> Result<&'a mut Executable> {
+        let value = value.into();
+        let arch = self.exe.arch().clone();
+        if !arch.supports_local_patching() {
+            return Err(Error::unsupported("assigning local variables", arch));
+        }
+        let name = self.locals[0].name.clone();
+        if !self.exe.is_forced_mut(&self.function.name, &name) {
+            let (found, reason) = self.declared_mutability();
+            if found != Mutability::Mutable {
+                return Err(Error::NotMutable {
+                    function: self.function.name.clone(),
+                    variable: name,
+                    reason,
+                });
+            }
+        }
+
+        let bitness = if arch == Arch::X86 { 32 } else { 64 };
+        let local = &self.locals[0];
+        let (register, disp) =
+            slot_of(local, self.function.frame_base, bitness).ok_or_else(|| {
+                Error::LocalPatch(format!("cannot locate the stack slot of `{name}`"))
+            })?;
+        let disp = i32::try_from(disp)
+            .map_err(|_| Error::LocalPatch(format!("stack offset of `{name}` is too large")))?;
+        let bytes = value.encode(&local.ty, self.exe.endian())?;
+        let code = x86::encode_store(register, disp, &bytes).ok_or_else(|| {
+            Error::LocalPatch(format!("cannot encode a store of {value} into `{name}`"))
+        })?;
+
+        let inside = self
+            .function
+            .ranges
+            .iter()
+            .any(|&(begin, end)| address >= begin && address + code.len() as u64 <= end);
+        if !inside {
+            return Err(Error::LocalPatch(format!(
+                "{address:#x} is not inside `{}`",
+                self.function.name
+            )));
+        }
+        let current = self.exe.code_bytes(address, code.len())?;
+        if !current.iter().all(|b| matches!(b, 0x90 | 0xCC)) {
+            return Err(Error::LocalPatch(format!(
+                "the {} bytes at {address:#x} are not padding: free them first with \
+                 `Executable::nop` (and commit), then call `assign_at`",
+                code.len()
+            )));
+        }
+        let description = format!("{}::{name} = {value}", self.function.name);
+        let offset = self.exe.vaddr_to_offset(address).ok_or(Error::NotInFile {
+            address,
+            reason: String::new(),
+        })?;
+        self.exe
+            .push_patch(offset, Some(address), code, description)?;
+        Ok(self.exe)
+    }
+
     fn apply(self, value: Value, all: bool) -> Result<&'a mut Executable> {
         let arch = self.exe.arch().clone();
         if !arch.supports_local_patching() {
@@ -271,27 +385,27 @@ impl<'a> LocalEditor<'a> {
     }
 }
 
+/// Registre et déplacement de l'emplacement de pile d'une variable.
+fn slot_of(local: &DwLocal, base: FrameBase, bitness: u32) -> Option<(iced_x86::Register, i64)> {
+    match base {
+        FrameBase::Register(number) => {
+            Some((x86::frame_register(number, bitness)?, local.frame_offset))
+        }
+        // CFA = valeur de rbp/ebp + 2 mots, quand un pointeur de frame existe.
+        FrameBase::Cfa if bitness == 64 => Some((iced_x86::Register::RBP, local.frame_offset - 16)),
+        FrameBase::Cfa => Some((iced_x86::Register::EBP, local.frame_offset - 8)),
+        FrameBase::Unknown => None,
+    }
+}
+
 /// L'instruction écrit-elle exactement dans l'emplacement de cette variable ?
 fn matches_slot(store: &ImmStore, local: &DwLocal, base: FrameBase, bitness: u32) -> bool {
     if store.has_index || store.mem_size != local.ty.size {
         return false;
     }
-    let (register, displacement) = match base {
-        FrameBase::Register(number) => match x86::frame_register(number, bitness) {
-            Some(register) => (register, local.frame_offset),
-            None => return false,
-        },
-        // CFA = valeur de rbp/ebp + 2 mots, quand un pointeur de frame existe.
-        FrameBase::Cfa => {
-            if bitness == 64 {
-                (iced_x86::Register::RBP, local.frame_offset - 16)
-            } else {
-                (iced_x86::Register::EBP, local.frame_offset - 8)
-            }
-        }
-        FrameBase::Unknown => return false,
-    };
-    store.base == register && store.disp == displacement
+    slot_of(local, base, bitness).is_some_and(|(register, displacement)| {
+        store.base == register && store.disp == displacement
+    })
 }
 
 /// Encode `value` pour le champ immédiat de l'instruction.
@@ -344,6 +458,7 @@ mod tests {
             },
             frame_offset: 0x14,
             decl_line: Some(3),
+            decl_file: None,
         }
     }
 

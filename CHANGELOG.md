@@ -1,5 +1,17 @@
 # Changelog
 
+## v0.2.0
+
+### Added
+- Mutability guard: ruwrite reads the declaration line of a local variable
+  (`let` / `let mut`) from the program's source and refuses to add a new
+  assignment to a variable that is not `mut` (`Error::NotMutable`).
+- `LocalEditor::mutability()`, `LocalEditor::make_mut()` (explicit opt-in to
+  modify a non-`mut` variable) and `Executable::set_source_root()`.
+- `LocalEditor::assign_at(address, value)`: inserts `variable = value;` in
+  padding left by `Executable::nop`, with the same encoding size as the compiler's.
+- `Mutability` public type.
+
 ## v0.1.0
 
 ### Added

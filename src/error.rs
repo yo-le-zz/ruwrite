@@ -160,6 +160,21 @@ pub enum Error {
     #[error("{0}")]
     LocalPatch(String),
 
+    /// The edit would modify a variable that is not declared `mut`.
+    #[error(
+        "`{variable}` in `{function}` is not declared `mut` ({reason}): \
+         changing it after its initialisation would not be valid Rust. \
+         Call `make_mut()` on the editor to allow it explicitly"
+    )]
+    NotMutable {
+        /// Function owning the variable.
+        function: String,
+        /// Variable name.
+        variable: String,
+        /// How the status was determined.
+        reason: String,
+    },
+
     /// Hot patching a running process failed.
     #[error("hot patch failed: {0}")]
     Live(String),

@@ -135,21 +135,44 @@ impl Sample {
         Sample(path)
     }
     fn code(&self) -> Vec<u8> {
-        let image = fs::read(&self.0).unwrap();
+        // Même précaution : on vient peut-être de réécrire ce fichier.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let image = loop {
+            match fs::read(&self.0) {
+                Ok(data) => break data,
+                Err(e) if Instant::now() < deadline => {
+                    let _ = e;
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                Err(e) => panic!("cannot read back {:?}: {e}", self.0),
+            }
+        };
         image[0x40..0x40 + 16].to_vec()
     }
     fn open(&self) -> Executable {
         // Même précaution qu'à l'écriture : réessaie si l'antivirus tient
         // encore le fichier verrouillé.
-        let deadline = Instant::now() + Duration::from_secs(5);
-        loop {
-            match Executable::open(&self.0) {
-                Ok(exe) => return exe,
-                Err(Error::Io { .. }) if Instant::now() < deadline => {
-                    std::thread::sleep(Duration::from_millis(50));
-                }
-                Err(e) => panic!("cannot open {:?}: {e}", self.0),
+        retry_io(|| Executable::open(&self.0))
+    }
+}
+
+/// Retries a fallible `ruwrite` operation for a few seconds before giving up.
+///
+/// On Windows CI runners, a sample file this test just wrote or is about to
+/// rewrite can be briefly locked by antivirus scanning, so an otherwise
+/// correct call (`Executable::open`, `commit`, ...) can fail with
+/// `PermissionDenied` even though nothing is genuinely wrong. Pending edits
+/// are only cleared by `commit` on success, so retrying it is safe: a failed
+/// attempt leaves them queued for the next one.
+fn retry_io<T>(mut f: impl FnMut() -> ruwrite::Result<T>) -> T {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match f() {
+            Ok(v) => return v,
+            Err(Error::Io { .. }) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(50));
             }
+            Err(e) => panic!("{e}"),
         }
     }
 }
@@ -173,7 +196,7 @@ fn x86_64_function_is_found_and_rewritten() {
     assert_eq!(exe.info().arch, Arch::X86_64);
     assert_eq!(exe.functions()[0].name, "demo::main");
     exe.function("main").unwrap().returns(7).unwrap();
-    exe.commit().unwrap();
+    retry_io(|| exe.commit());
     assert_eq!(&s.code()[..6], [0xB8, 7, 0, 0, 0, 0xC3]);
 }
 
@@ -183,7 +206,7 @@ fn aarch64_function_is_found_and_rewritten() {
     let mut exe = s.open();
     assert_eq!(exe.info().arch, Arch::Aarch64);
     exe.function("demo::main").unwrap().returns(42).unwrap();
-    exe.commit().unwrap();
+    retry_io(|| exe.commit());
     // mov w0, #42 ; ret
     assert_eq!(
         &s.code()[..8],
@@ -192,7 +215,7 @@ fn aarch64_function_is_found_and_rewritten() {
 
     let mut exe = s.open();
     exe.function("main").unwrap().disable().unwrap();
-    exe.commit().unwrap();
+    retry_io(|| exe.commit());
     assert_eq!(&s.code()[..4], [0xC0, 0x03, 0x5F, 0xD6]);
 
     // Désassemblage et patch de locaux : réservés à x86.
@@ -214,7 +237,7 @@ fn unsupported_arch_still_allows_byte_patches() {
     ));
     // Le patch d'octets bruts, lui, marche partout.
     exe.patch_bytes(TEXT_ADDR, &[0xAA, 0xBB]).unwrap();
-    exe.commit().unwrap();
+    retry_io(|| exe.commit());
     assert_eq!(&s.code()[..3], [0xAA, 0xBB, 0x90]);
 }
 
@@ -227,5 +250,5 @@ fn raw_patching_needs_no_debug_info() {
     assert_eq!(exe.read_bytes(TEXT_ADDR, 2).unwrap(), [0x90, 0x90]);
     exe.nop(TEXT_ADDR + 4, 4).unwrap();
     assert!(exe.variables().is_err(), "no DWARF in this sample");
-    assert_eq!(exe.commit().unwrap().bytes, 4);
+    assert_eq!(retry_io(|| exe.commit()).bytes, 4);
 }

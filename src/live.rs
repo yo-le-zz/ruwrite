@@ -115,6 +115,7 @@ pub(crate) fn apply(_image: &[u8], _pid: u32, _patches: &[Patch]) -> Result<usiz
 }
 
 /// A `PT_LOAD` segment: where it lives in the file and where it is linked to run.
+#[cfg(target_os = "linux")]
 #[derive(Debug, Clone, Copy)]
 struct Segment {
     file_offset: u64,

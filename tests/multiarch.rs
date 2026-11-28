@@ -113,7 +113,7 @@ struct Sample(PathBuf);
 /// anything ruwrite does to the user's own files.
 fn write_then_wait_readable(path: &std::path::Path, data: &[u8]) {
     fs::write(path, data).unwrap();
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         match fs::read(path) {
             Ok(_) => return,
@@ -136,7 +136,7 @@ impl Sample {
     }
     fn code(&self) -> Vec<u8> {
         // Même précaution : on vient peut-être de réécrire ce fichier.
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + Duration::from_secs(30);
         let image = loop {
             match fs::read(&self.0) {
                 Ok(data) => break data,
@@ -165,7 +165,7 @@ impl Sample {
 /// are only cleared by `commit` on success, so retrying it is safe: a failed
 /// attempt leaves them queued for the next one.
 fn retry_io<T>(mut f: impl FnMut() -> ruwrite::Result<T>) -> T {
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         match f() {
             Ok(v) => return v,

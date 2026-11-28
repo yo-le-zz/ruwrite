@@ -48,12 +48,21 @@ jobs:
         os: [windows-latest, macos-latest]
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - name: Exclude the temp directory from Windows Defender
+      - name: Stop Windows Defender from scanning the test's temp files
+        # The multiarch tests write tiny hand-built ELF executables to the
+        # temp directory and immediately read/rewrite them; real-time
+        # scanning can hold a lock on a freshly written executable-looking
+        # file for a few seconds (occasionally longer under CI load), which
+        # the exclusion alone does not reliably prevent in time. Turning
+        # scanning off for this job is simpler and more reliable than
+        # racing it with retries alone (still done too, see multiarch.rs).
         if: runner.os == 'Windows'
         shell: pwsh
-        run: Add-MpPreference -ExclusionPath "$env:RUNNER_TEMP","$env:TEMP"
+        run: |
+          Add-MpPreference -ExclusionPath "$env:RUNNER_TEMP","$env:TEMP"
+          Set-MpPreference -DisableRealtimeMonitoring $true
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
       - run: cargo test --lib --test multiarch
 
   msrv:

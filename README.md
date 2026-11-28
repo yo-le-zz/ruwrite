@@ -347,6 +347,13 @@ has honest limits:
   already copied a value elsewhere keep the old one.
 - **Code signing / integrity checks.** A modified binary no longer matches its
   signature or checksum.
+- **Windows: Controlled Folder Access.** `commit()` replaces the target file
+  with a write-then-rename, the same thing ransomware protection is designed
+  to catch: if Controlled Folder Access is on and the program is not on its
+  allow list, the rename is refused outright (and, unlike antivirus scanning,
+  does not clear up on its own — retrying does not help). `commit_to` a path
+  outside a protected folder, or allow your program under Windows Security →
+  Virus & threat protection → Ransomware protection, if you hit this.
 - Code generation (`returns`, `disable`, `redirect_to`) covers x86, x86_64 and
   aarch64. Elsewhere use `replace_code` with your own bytes.
 

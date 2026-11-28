@@ -51,14 +51,45 @@ jobs:
       - name: Soften Windows Defender for the test's temp files
         # Best effort only: GitHub's windows-latest image has Tamper
         # Protection on, which can silently keep `Set-MpPreference` from
-        # taking effect at all. The actual fix is the retry below; this is
-        # free to attempt and occasionally helps, never required.
+        # taking effect at all. `EnableControlledFolderAccess` is the one
+        # that actually matters here: real-time scanning only *delays* access
+        # to a file, but Controlled Folder Access (ransomware protection)
+        # outright refuses to let an unrecognised app replace an *existing*
+        # file in a protected folder — which is exactly what `commit()`'s
+        # write-then-rename does, and unlike a scan, that refusal never
+        # times out on its own.
         if: runner.os == 'Windows'
         shell: pwsh
         continue-on-error: true
         run: |
           Add-MpPreference -ExclusionPath "$env:RUNNER_TEMP","$env:TEMP"
           Set-MpPreference -DisableRealtimeMonitoring $true
+          Set-MpPreference -EnableControlledFolderAccess Disabled
+      - name: Diagnose Defender's effect on a plain temp-file overwrite
+        # Independent of ruwrite/cargo entirely: reproduces `commit()`'s
+        # write-then-rename with plain PowerShell, so a failure here proves
+        # the environment refuses this regardless of what wrote the file,
+        # and the settings above show whether the softening step actually
+        # applied. Never fails the job; it only leaves a trail in the log
+        # for whoever next has to make sense of a repeat failure below.
+        if: runner.os == 'Windows'
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          Write-Host "--- Get-MpPreference (relevant fields) ---"
+          Get-MpPreference | Select-Object DisableRealtimeMonitoring, EnableControlledFolderAccess, ExclusionPath | Format-List
+          Write-Host "--- manual repro: create, then overwrite-by-rename, a fresh TEMP file ---"
+          $probe = Join-Path $env:TEMP "ruwrite-ci-probe.bin"
+          $tmp = "$probe.tmp"
+          [IO.File]::WriteAllBytes($probe, [byte[]](1, 2, 3, 4))
+          try {
+            [IO.File]::WriteAllBytes($tmp, [byte[]](5, 6, 7, 8))
+            Move-Item -Path $tmp -Destination $probe -Force
+            Write-Host "overwrite-by-rename: OK"
+          } catch {
+            Write-Host "overwrite-by-rename: FAILED: $_"
+          }
+          Remove-Item $probe, $tmp -ErrorAction SilentlyContinue
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Run the multi-arch tests

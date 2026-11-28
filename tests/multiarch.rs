@@ -6,6 +6,7 @@
 
 use std::fs;
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
 use ruwrite::{Arch, Error, Executable};
 
@@ -102,17 +103,54 @@ fn build_elf(machine: u16, code: &[u8]) -> Vec<u8> {
 
 struct Sample(PathBuf);
 
+/// Writes `data` to `path`, then waits until it can be read back.
+///
+/// On Windows CI runners, a file whose content starts with an executable
+/// magic number (`\x7fELF` here) can be briefly locked by antivirus
+/// scanning right after it is created, so an immediate read fails with
+/// "Access is denied" even though the write itself succeeded. This is purely
+/// about the sample files this test writes to a temp directory, not about
+/// anything ruwrite does to the user's own files.
+fn write_then_wait_readable(path: &std::path::Path, data: &[u8]) {
+    fs::write(path, data).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match fs::read(path) {
+            Ok(_) => return,
+            Err(e) if Instant::now() < deadline => {
+                let _ = e;
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(e) => panic!("cannot read back {path:?} after writing it: {e}"),
+        }
+    }
+}
+
 impl Sample {
     fn new(tag: &str, machine: u16, code: &[u8]) -> Sample {
         let dir = std::env::temp_dir().join(format!("ruwrite-arch-{}-{tag}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("sample");
-        fs::write(&path, build_elf(machine, code)).unwrap();
+        write_then_wait_readable(&path, &build_elf(machine, code));
         Sample(path)
     }
     fn code(&self) -> Vec<u8> {
         let image = fs::read(&self.0).unwrap();
         image[0x40..0x40 + 16].to_vec()
+    }
+    fn open(&self) -> Executable {
+        // Même précaution qu'à l'écriture : réessaie si l'antivirus tient
+        // encore le fichier verrouillé.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match Executable::open(&self.0) {
+                Ok(exe) => return exe,
+                Err(Error::Io { .. }) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                Err(e) => panic!("cannot open {:?}: {e}", self.0),
+            }
+        }
     }
 }
 
@@ -131,7 +169,7 @@ const A64_BODY: [u8; 16] = [
 #[test]
 fn x86_64_function_is_found_and_rewritten() {
     let s = Sample::new("x86", MACHINE_X86_64, &X86_BODY);
-    let mut exe = Executable::open(&s.0).unwrap();
+    let mut exe = s.open();
     assert_eq!(exe.info().arch, Arch::X86_64);
     assert_eq!(exe.functions()[0].name, "demo::main");
     exe.function("main").unwrap().returns(7).unwrap();
@@ -142,7 +180,7 @@ fn x86_64_function_is_found_and_rewritten() {
 #[test]
 fn aarch64_function_is_found_and_rewritten() {
     let s = Sample::new("a64", MACHINE_AARCH64, &A64_BODY);
-    let mut exe = Executable::open(&s.0).unwrap();
+    let mut exe = s.open();
     assert_eq!(exe.info().arch, Arch::Aarch64);
     exe.function("demo::main").unwrap().returns(42).unwrap();
     exe.commit().unwrap();
@@ -152,13 +190,13 @@ fn aarch64_function_is_found_and_rewritten() {
         [0x40, 0x05, 0x80, 0x52, 0xC0, 0x03, 0x5F, 0xD6]
     );
 
-    let mut exe = Executable::open(&s.0).unwrap();
+    let mut exe = s.open();
     exe.function("main").unwrap().disable().unwrap();
     exe.commit().unwrap();
     assert_eq!(&s.code()[..4], [0xC0, 0x03, 0x5F, 0xD6]);
 
     // Désassemblage et patch de locaux : réservés à x86.
-    let mut exe = Executable::open(&s.0).unwrap();
+    let mut exe = s.open();
     assert!(matches!(
         exe.function("main").unwrap().disassemble(),
         Err(Error::Unsupported { .. })
@@ -168,7 +206,7 @@ fn aarch64_function_is_found_and_rewritten() {
 #[test]
 fn unsupported_arch_still_allows_byte_patches() {
     let s = Sample::new("rv", MACHINE_RISCV, &X86_BODY);
-    let mut exe = Executable::open(&s.0).unwrap();
+    let mut exe = s.open();
     assert_eq!(exe.info().arch, Arch::Riscv64);
     assert!(matches!(
         exe.function("main").unwrap().returns(1),
@@ -185,7 +223,7 @@ fn raw_patching_needs_no_debug_info() {
     // Lecture et écriture d'octets par adresse : aucune information de debug
     // n'est nécessaire (ici l'exemple n'a pas de DWARF).
     let s = Sample::new("raw", MACHINE_X86_64, &X86_BODY);
-    let mut exe = Executable::open(&s.0).unwrap();
+    let mut exe = s.open();
     assert_eq!(exe.read_bytes(TEXT_ADDR, 2).unwrap(), [0x90, 0x90]);
     exe.nop(TEXT_ADDR + 4, 4).unwrap();
     assert!(exe.variables().is_err(), "no DWARF in this sample");

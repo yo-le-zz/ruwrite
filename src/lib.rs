@@ -63,13 +63,45 @@ mod exe;
 mod live;
 mod mutability;
 mod patch;
+mod protect;
 mod value;
 mod x86;
 
 pub use arch::{Arch, Endian, Format, Info};
 pub use edit::{FunctionEditor, LocalEditor};
 pub use error::{Error, Result};
-pub use exe::{CommitReport, Executable, Function, Section, Variable, VariableKind};
+pub use exe::{
+    CommitReport, Executable, Function, IntegrityIssue, IntegritySnapshot, IntegrityViolation,
+    Section, ValueMatch, Variable, VariableKind,
+};
 pub use mutability::Mutability;
 pub use patch::Patch;
+pub use protect::{Protection, ProtectionMode, ProtectionTarget};
+pub use ruwrite_macros::protect;
 pub use value::{Class, ScalarType, Value};
+
+/// Declares the **whole executable** as protected: `ruwrite` refuses every
+/// edit, whatever it targets. For one function or `static`, use
+/// [`macro@protect`] on it instead.
+///
+/// ```
+/// ruwrite::protect_all!();
+/// ```
+#[macro_export]
+macro_rules! protect_all {
+    () => {
+        #[doc(hidden)]
+        const _: () = {
+            #[used]
+            #[cfg_attr(
+                any(target_os = "macos", target_os = "ios"),
+                link_section = "__DATA,__ruwprot"
+            )]
+            #[cfg_attr(
+                not(any(target_os = "macos", target_os = "ios")),
+                link_section = ".ruwprot"
+            )]
+            static RUWRITE_RECORD: [u8; 13] = *b"RUWPROT2\x03\x01\x00\x00\x00";
+        };
+    };
+}

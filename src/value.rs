@@ -85,6 +85,33 @@ impl_from!(
     u8 => U8, u16 => U16, u32 => U32, u64 => U64, f32 => F32, f64 => F64,
 );
 
+macro_rules! impl_named_constructor {
+    ($($name:ident: $ty:ty => $variant:ident),* $(,)?) => {
+        $(
+            #[doc = concat!(
+                "Builds a `", stringify!($ty), "` value: the number stays separate \\
+                 from its type, instead of a literal suffix like `3", stringify!($ty), "`."
+            )]
+            pub fn $name(n: $ty) -> Value {
+                Value::$variant(n)
+            }
+        )*
+    };
+}
+
+impl Value {
+    /// Builds a `bool` value.
+    pub fn bool(b: bool) -> Value {
+        Value::Bool(b)
+    }
+
+    impl_named_constructor!(
+        i8: i8 => I8, i16: i16 => I16, i32: i32 => I32, i64: i64 => I64,
+        u8: u8 => U8, u16: u16 => U16, u32: u32 => U32, u64: u64 => U64,
+        f32: f32 => F32, f64: f64 => F64,
+    );
+}
+
 impl fmt::Display for Value {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -121,6 +148,17 @@ impl Value {
         }
     }
 
+    /// Size in bytes of this value's own type (1 for `bool`/`i8`/`u8`, 8 for
+    /// `i64`/`u64`/`f64`, ...).
+    pub fn size(&self) -> usize {
+        match self {
+            Value::Bool(_) | Value::I8(_) | Value::U8(_) => 1,
+            Value::I16(_) | Value::U16(_) => 2,
+            Value::I32(_) | Value::U32(_) | Value::F32(_) => 4,
+            Value::I64(_) | Value::U64(_) | Value::F64(_) => 8,
+        }
+    }
+
     /// Category of this value.
     pub fn class(&self) -> Class {
         match self {
@@ -144,6 +182,17 @@ impl Value {
             Value::U64(v) => v.into(),
             _ => return None,
         })
+    }
+
+    /// The type of this value itself (its own name, class and size),
+    /// usable as a [`ScalarType`] when no variable description is at hand —
+    /// this is what lets a value be recognised in memory without DWARF.
+    pub fn own_type(&self) -> ScalarType {
+        ScalarType {
+            name: self.type_name().into(),
+            class: self.class(),
+            size: self.size(),
+        }
     }
 
     /// Encodes this value for a destination of the given type.

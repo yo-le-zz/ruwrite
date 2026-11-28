@@ -175,9 +175,37 @@ pub enum Error {
         reason: String,
     },
 
+    /// The part of the program is declared sensitive and protected.
+    #[error(
+        "{what} is defined as sensitive and protected by the program \
+         (rule: {rule}): ruwrite refuses to modify it"
+    )]
+    Protected {
+        /// What the edit tried to touch.
+        what: String,
+        /// The protection rule declared by the program.
+        rule: String,
+    },
+
+    /// The edit would produce code that the Rust compiler would not accept.
+    #[error("rejected, the compiler would not accept this: {0}")]
+    Rejected(String),
+
     /// Hot patching a running process failed.
     #[error("hot patch failed: {0}")]
     Live(String),
+
+    /// The function was not compiled as a standalone piece of code: every
+    /// call site got its own inlined copy instead.
+    #[error(
+        "function `{name}` has no standalone machine code: the compiler inlined every call to it \
+         instead of keeping one copy. Mark it `#[inline(never)]` and rebuild so ruwrite has a \
+         single place to rewrite"
+    )]
+    Inlined {
+        /// Function name.
+        name: String,
+    },
 }
 
 fn reason_suffix(reason: &str) -> String {

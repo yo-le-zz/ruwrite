@@ -21,8 +21,8 @@ use crate::dwarf::{DwFunction, DwLocal, FrameBase};
 use crate::error::{Error, Result};
 use crate::exe::{Executable, Function};
 use crate::mutability::{self, Mutability};
-use crate::value::Value;
-use crate::x86::{self, ImmStore};
+use crate::value::{Class, Value};
+use crate::x86::{self, ImmStore, JccFamily};
 
 /// Editor for one function of the executable.
 pub struct FunctionEditor<'a> {
@@ -76,7 +76,26 @@ impl<'a> FunctionEditor<'a> {
     /// function expects `Value::I32`, a `bool` function expects a `bool`).
     /// Supported on x86, x86_64 and aarch64.
     pub fn returns(self, value: impl Into<Value>) -> Result<&'a mut Executable> {
-        let value = value.into();
+        self.guard()?;
+        let mut value = value.into();
+        // Contrôle de type, comme le ferait le compilateur : la valeur doit
+        // être valide pour le type de retour déclaré dans les infos de debug.
+        if let Some((ret, _)) = self.exe.signature(self.function.address) {
+            let Some(ty) = ret else {
+                return Err(Error::Rejected(format!(
+                    "`{}` returns `()`, it cannot return {value}; use `disable()`",
+                    self.function.name
+                )));
+            };
+            if ty.class == crate::value::Class::Other {
+                return Err(Error::Rejected(format!(
+                    "`{}` returns `{}`, which is not a scalar; provide the code with `replace_code`",
+                    self.function.name, ty.name
+                )));
+            }
+            let bytes = value.encode(&ty, self.exe.endian())?;
+            value = Value::decode(&bytes, &ty, self.exe.endian())?;
+        }
         let code = code::return_value(self.exe.arch(), value)?;
         let description = format!("{} always returns {value}", self.function.name);
         self.write_prefix(code, description)
@@ -84,6 +103,13 @@ impl<'a> FunctionEditor<'a> {
 
     /// Makes the function return immediately (for functions returning `()`).
     pub fn disable(self) -> Result<&'a mut Executable> {
+        self.guard()?;
+        if let Some((Some(ty), _)) = self.exe.signature(self.function.address) {
+            return Err(Error::Rejected(format!(
+                "`{}` returns `{}`, a bare `ret` would leave the result undefined; use `returns(..)`",
+                self.function.name, ty.name
+            )));
+        }
         let code = code::ret(self.exe.arch())?;
         let description = format!("{} disabled", self.function.name);
         self.write_prefix(code, description)
@@ -94,7 +120,22 @@ impl<'a> FunctionEditor<'a> {
     /// `target` must have the same signature. Needs room for a jump at the
     /// start of the function (5 bytes on x86, 4 on aarch64).
     pub fn redirect_to(self, target: &str) -> Result<&'a mut Executable> {
+        self.guard()?;
         let destination = self.exe.find_function(target)?.clone();
+        if let (Some(from), Some(to)) = (
+            self.exe.signature(self.function.address),
+            self.exe.signature(destination.address),
+        ) {
+            if from != to {
+                return Err(Error::Rejected(format!(
+                    "`{}` and `{}` have different signatures ({} vs {})",
+                    self.function.name,
+                    destination.name,
+                    describe_signature(&from),
+                    describe_signature(&to)
+                )));
+            }
+        }
         let code = code::jump(self.exe.arch(), self.function.address, destination.address)?;
         let description = format!("{} -> {}", self.function.name, destination.name);
         self.write_prefix(code, description)
@@ -103,6 +144,7 @@ impl<'a> FunctionEditor<'a> {
     /// Replaces the beginning of the function by `machine_code`, filling the
     /// rest with `nop`. The code must fit in the function.
     pub fn replace_code(self, machine_code: &[u8]) -> Result<&'a mut Executable> {
+        self.guard()?;
         let size = usize::try_from(self.function.size).unwrap_or(usize::MAX);
         if machine_code.len() > size {
             return Err(self.too_small(machine_code.len()));
@@ -111,6 +153,12 @@ impl<'a> FunctionEditor<'a> {
         full.extend(code::nop_run(self.exe.arch(), size - machine_code.len())?);
         let description = format!("{} rewritten", self.function.name);
         self.write_prefix(full, description)
+    }
+
+    /// La protection déclarée par le programme passe avant toute autre vérification.
+    fn guard(&self) -> Result<()> {
+        self.exe
+            .check_guards(self.file_offset()?, self.function.size)
     }
 
     fn file_offset(&self) -> Result<u64> {
@@ -140,6 +188,17 @@ impl<'a> FunctionEditor<'a> {
     }
 }
 
+fn describe_signature(
+    sig: &(
+        Option<crate::value::ScalarType>,
+        Vec<crate::value::ScalarType>,
+    ),
+) -> String {
+    let params: Vec<&str> = sig.1.iter().map(|t| t.name.as_str()).collect();
+    let ret = sig.0.as_ref().map_or("()", |t| t.name.as_str());
+    format!("({}) -> {ret}", params.join(", "))
+}
+
 /// Editor for a local variable of a function.
 ///
 /// Only the **initial value** can be rewritten: the compiler stores it with a
@@ -153,6 +212,7 @@ pub struct LocalEditor<'a> {
     exe: &'a mut Executable,
     function: DwFunction,
     locals: Vec<DwLocal>,
+    cascade: bool,
 }
 
 /// Une instruction candidate et la variable à laquelle elle correspond.
@@ -169,7 +229,26 @@ impl<'a> LocalEditor<'a> {
             exe,
             function,
             locals,
+            cascade: false,
         }
+    }
+
+    /// Opts into **cascade mode**: when the value given to [`set`](Self::set)
+    /// or [`set_all`](Self::set_all) does not have the same signedness as the
+    /// variable's declared type (for instance writing [`Value::u8`] into an
+    /// `i32`), every `<` / `<=` / `>` / `>=` comparison made directly against
+    /// the variable's stack slot in the same function is flipped between its
+    /// signed and unsigned reading, so the rest of the function keeps
+    /// treating the new value the way it is meant to be read.
+    ///
+    /// Only comparisons compiled as `cmp` directly on the slot are found
+    /// (the same limitation [`set`](Self::set) itself has for finding the
+    /// store): one done through a register loaded from the slot is left
+    /// untouched, and nothing is touched when the signedness does not
+    /// change.
+    pub fn cascade(mut self) -> Self {
+        self.cascade = true;
+        self
     }
 
     /// Rewrites the initial value of the variable.
@@ -344,6 +423,7 @@ impl<'a> LocalEditor<'a> {
 
         // Tout est encodé avant la première mise en file d'attente.
         let mut edits = Vec::with_capacity(chosen.len());
+        let mut touched_locals = Vec::new();
         for c in &chosen {
             let local = &self.locals[c.local];
             let imm = encode_immediate(value, local, &c.store, endian)?;
@@ -352,12 +432,91 @@ impl<'a> LocalEditor<'a> {
                 self.function.name, local.name, local.ty.name, c.store.value
             );
             edits.push((c.file_offset, c.address, imm, description));
+            touched_locals.push(c.local);
         }
+
+        let cascade = if self.cascade {
+            self.find_cascade(&touched_locals, value, bitness)?
+        } else {
+            Vec::new()
+        };
+
         for (file_offset, address, imm, description) in edits {
             self.exe
                 .push_patch(file_offset, Some(address), imm, description)?;
         }
+        for (file_offset, address, byte, description) in cascade {
+            self.exe
+                .push_patch(file_offset, Some(address), vec![byte], description)?;
+        }
         Ok(self.exe)
+    }
+
+    /// Finds `<` / `<=` / `>` / `>=` comparisons made directly against the
+    /// stack slot of a touched local whose family (signed/unsigned) no
+    /// longer matches `value`'s own signedness, so cascade mode can flip
+    /// them. Does nothing when the local's declared type and `value` agree,
+    /// or are not comparable (bools, floats).
+    fn find_cascade(
+        &self,
+        touched_locals: &[usize],
+        value: Value,
+        bitness: u32,
+    ) -> Result<Vec<(u64, u64, u8, String)>> {
+        let want = match value.own_type().class {
+            Class::Signed => JccFamily::Signed,
+            Class::Unsigned => JccFamily::Unsigned,
+            _ => return Ok(Vec::new()),
+        };
+
+        let mut patches = Vec::new();
+        let mut done = std::collections::HashSet::new();
+        for &index in touched_locals {
+            if !done.insert(index) {
+                continue;
+            }
+            let local = &self.locals[index];
+            let declared = match local.ty.class {
+                Class::Signed => Some(JccFamily::Signed),
+                Class::Unsigned => Some(JccFamily::Unsigned),
+                _ => None,
+            };
+            if declared == Some(want) {
+                continue; // la variable garde le même signe : rien à propager
+            }
+            let Some((register, disp)) = slot_of(local, self.function.frame_base, bitness) else {
+                continue;
+            };
+            for &(begin, end) in &self.function.ranges {
+                let offset = self.exe.vaddr_to_offset(begin).ok_or(Error::NotInFile {
+                    address: begin,
+                    reason: format!("function `{}`", self.function.name),
+                })?;
+                let code = self.exe.slice(offset, end - begin)?;
+                for site in x86::scan_slot_comparisons(code, begin, bitness, register, disp) {
+                    if site.family == want {
+                        continue;
+                    }
+                    let Some(flipped) = x86::flip_condition_byte(code[site.condition_offset])
+                    else {
+                        continue;
+                    };
+                    let address = begin + site.condition_offset as u64;
+                    let description = format!(
+                        "{}: cascade — comparison against `{}` at {address:#x} switched to {:?} \
+                         to match its new value",
+                        self.function.name, local.name, want
+                    );
+                    patches.push((
+                        offset + site.condition_offset as u64,
+                        address,
+                        flipped,
+                        description,
+                    ));
+                }
+            }
+        }
+        Ok(patches)
     }
 
     fn find_candidates(&self, bitness: u32) -> Result<Vec<Candidate>> {

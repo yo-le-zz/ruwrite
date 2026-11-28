@@ -4,7 +4,7 @@
 //! constant into the stack slot of `a`. Finding that store is what allows
 //! ruwrite to change the initial value of a local variable.
 
-use iced_x86::{Decoder, DecoderOptions, Mnemonic, OpKind, Register};
+use iced_x86::{ConditionCode, Decoder, DecoderOptions, Instruction, Mnemonic, OpKind, Register};
 
 /// A `mov [mem], imm` instruction.
 #[derive(Debug, Clone)]
@@ -168,6 +168,126 @@ pub fn frame_register(dwarf_reg: u16, bitness: u32) -> Option<Register> {
     }
 }
 
+/// Whether a conditional jump reads its `cmp` as a signed or an unsigned
+/// comparison. `cascade mode` ([`crate::edit::LocalEditor`]) keeps these
+/// consistent with a variable's new signedness.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JccFamily {
+    /// `jl` / `jge` / `jle` / `jg`.
+    Signed,
+    /// `jb` / `jae` / `jbe` / `ja`.
+    Unsigned,
+}
+
+/// A conditional jump found right after a `cmp` against the same stack slot
+/// as a local variable.
+#[derive(Debug, Clone, Copy)]
+pub struct SlotComparison {
+    /// Offset, in the scanned code, of the single byte that encodes the
+    /// condition: the opcode itself for the short `0x7_` form, the byte
+    /// after `0F` for the near `0F 8_` form.
+    pub condition_offset: usize,
+    /// Current family of the condition.
+    pub family: JccFamily,
+}
+
+/// Scans `code` for a conditional jump that immediately follows a `cmp`
+/// touching the stack slot at `base + disp` (the same test
+/// [`scan_imm_stores`] uses to recognise a store to a local).
+///
+/// Only the direct `cmp [base+disp], ..` form is matched: a comparison done
+/// through a register loaded from the slot is not tracked back to it, the
+/// same limitation [`scan_imm_stores`] has for stores.
+pub fn scan_slot_comparisons(
+    code: &[u8],
+    ip: u64,
+    bitness: u32,
+    base: Register,
+    disp: i64,
+) -> Vec<SlotComparison> {
+    let mut decoder = Decoder::with_ip(bitness, code, ip, DecoderOptions::NONE);
+    let mut found = Vec::new();
+    let mut after_matching_cmp = false;
+
+    while decoder.can_decode() {
+        let offset = decoder.position();
+        let insn = decoder.decode();
+        if insn.is_invalid() {
+            after_matching_cmp = false;
+            continue;
+        }
+        if insn.mnemonic() == Mnemonic::Cmp {
+            after_matching_cmp = touches_slot(&insn, bitness, base, disp);
+            continue;
+        }
+        if after_matching_cmp {
+            if let Some(family) = jcc_family(insn.condition_code()) {
+                let condition_offset = match insn.len() {
+                    2 => Some(offset),     // 0x7X rel8
+                    6 => Some(offset + 1), // 0F 8X rel32
+                    _ => None,
+                };
+                if let Some(condition_offset) = condition_offset {
+                    found.push(SlotComparison {
+                        condition_offset,
+                        family,
+                    });
+                }
+            }
+        }
+        after_matching_cmp = false;
+    }
+    found
+}
+
+fn touches_slot(insn: &Instruction, bitness: u32, base: Register, disp: i64) -> bool {
+    for i in 0..insn.op_count() {
+        if insn.op_kind(i) == OpKind::Memory
+            && insn.memory_base() == base
+            && insn.memory_index() == Register::None
+            && signed_displacement(insn.memory_displacement64(), bitness) == disp
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn jcc_family(cc: ConditionCode) -> Option<JccFamily> {
+    match cc {
+        ConditionCode::l | ConditionCode::ge | ConditionCode::le | ConditionCode::g => {
+            Some(JccFamily::Signed)
+        }
+        ConditionCode::b | ConditionCode::ae | ConditionCode::be | ConditionCode::a => {
+            Some(JccFamily::Unsigned)
+        }
+        _ => None,
+    }
+}
+
+/// The byte that flips a conditional jump between the signed and the
+/// unsigned reading of the same comparison (`jl` <-> `jb`, `jge` <-> `jae`,
+/// `jle` <-> `jbe`, `jg` <-> `ja`), keeping the instruction's length and form
+/// (short or near) identical. `None` for a condition with no counterpart in
+/// the other family (`je`, `jo`, `js`, ...).
+pub fn flip_condition_byte(current: u8) -> Option<u8> {
+    const PAIRS: [(u8, u8); 4] = [(0xC, 0x2), (0xD, 0x3), (0xE, 0x6), (0xF, 0x7)];
+    let high = current & 0xF0;
+    let low = current & 0x0F;
+    if high != 0x70 && high != 0x80 {
+        return None;
+    }
+    for &(signed, unsigned) in &PAIRS {
+        if low == signed {
+            return Some(high | unsigned);
+        }
+        if low == unsigned {
+            return Some(high | signed);
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -251,5 +371,52 @@ mod tests {
         assert_eq!(mask(0x1_2345_6789, 4), 0x2345_6789);
         assert_eq!(mask(u64::MAX, 8), u64::MAX);
         assert_eq!(mask(0x1FF, 1), 0xFF);
+    }
+
+    #[test]
+    fn finds_a_signed_compare_against_the_slot_short_form() {
+        // cmp dword ptr [rbp-4], 5 ; jl +0x10
+        let code = [0x83, 0x7D, 0xFC, 0x05, 0x7C, 0x10];
+        let found = scan_slot_comparisons(&code, 0, 64, Register::RBP, -4);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].condition_offset, 4);
+        assert_eq!(found[0].family, JccFamily::Signed);
+    }
+
+    #[test]
+    fn finds_an_unsigned_compare_near_form() {
+        // cmp dword ptr [rbp-4], 5 ; ja (near, 0F 87 + rel32)
+        let code = [0x83, 0x7D, 0xFC, 0x05, 0x0F, 0x87, 0x10, 0x00, 0x00, 0x00];
+        let found = scan_slot_comparisons(&code, 0, 64, Register::RBP, -4);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].condition_offset, 5);
+        assert_eq!(found[0].family, JccFamily::Unsigned);
+    }
+
+    #[test]
+    fn ignores_a_compare_against_a_different_slot() {
+        // cmp dword ptr [rbp-8], 5 ; jl +0x10 (watching slot at -4)
+        let code = [0x83, 0x7D, 0xF8, 0x05, 0x7C, 0x10];
+        assert!(scan_slot_comparisons(&code, 0, 64, Register::RBP, -4).is_empty());
+    }
+
+    #[test]
+    fn ignores_a_jump_with_no_signed_unsigned_counterpart() {
+        // cmp dword ptr [rbp-4], 5 ; je +0x10 (equality has no signedness)
+        let code = [0x83, 0x7D, 0xFC, 0x05, 0x74, 0x10];
+        assert!(scan_slot_comparisons(&code, 0, 64, Register::RBP, -4).is_empty());
+    }
+
+    #[test]
+    fn flips_every_signed_unsigned_pair_and_rejects_the_rest() {
+        assert_eq!(flip_condition_byte(0x7C), Some(0x72)); // jl  -> jb
+        assert_eq!(flip_condition_byte(0x72), Some(0x7C)); // jb  -> jl
+        assert_eq!(flip_condition_byte(0x7D), Some(0x73)); // jge -> jae
+        assert_eq!(flip_condition_byte(0x7E), Some(0x76)); // jle -> jbe
+        assert_eq!(flip_condition_byte(0x7F), Some(0x77)); // jg  -> ja
+        assert_eq!(flip_condition_byte(0x8C), Some(0x82)); // near jl -> jb
+        assert_eq!(flip_condition_byte(0x87), Some(0x8F)); // near ja -> jg
+        assert_eq!(flip_condition_byte(0x74), None); // je has no counterpart
+        assert_eq!(flip_condition_byte(0x00), None); // unrelated opcode
     }
 }

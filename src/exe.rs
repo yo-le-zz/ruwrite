@@ -15,6 +15,7 @@ use crate::edit::{FunctionEditor, LocalEditor};
 use crate::error::{Error, Result};
 use crate::live;
 use crate::patch::{checked_range, Patch, PatchSet};
+use crate::protect::{self, Guard, Protection, ProtectionMode, ProtectionTarget, RawTarget, Rule};
 use crate::value::Value;
 
 /// A section of the executable.
@@ -81,6 +82,47 @@ pub enum VariableKind {
     },
 }
 
+/// A place in memory whose current bytes match a value given to
+/// [`Executable::find_value`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct ValueMatch {
+    /// Virtual address of the match.
+    pub address: u64,
+    /// Size in bytes of the matched value.
+    pub size: u64,
+    /// Symbol name at this address, when one is known (works without DWARF
+    /// when the symbol table has it; falls back to DWARF statics otherwise).
+    pub name: Option<String>,
+}
+
+/// Hashes of every `#[protect(protected)]` part, taken at one point in time.
+/// Opaque: build one with [`Executable::integrity_snapshot`] and compare it
+/// later with [`Executable::verify_integrity`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct IntegritySnapshot {
+    entries: Vec<(String, u64)>,
+}
+
+/// One difference found by [`Executable::verify_integrity`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IntegrityViolation {
+    /// Which protected part this is about.
+    pub what: String,
+    /// What changed about it.
+    pub kind: IntegrityIssue,
+}
+
+/// What kind of difference [`IntegrityViolation`] reports.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IntegrityIssue {
+    /// Its bytes no longer match the snapshot.
+    Changed,
+    /// It was in the snapshot but is not protected any more.
+    Missing,
+    /// It is protected now but was not in the snapshot.
+    New,
+}
+
 /// Summary returned by the `commit*` methods.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CommitReport {
@@ -113,6 +155,9 @@ pub struct Executable {
     backup: bool,
     source_root: Option<PathBuf>,
     forced_mut: HashSet<(String, String)>,
+    protections: Vec<Protection>,
+    guards: Vec<Guard>,
+    data_symbols: Vec<(String, u64, u64)>,
 }
 
 impl fmt::Debug for Executable {
@@ -130,6 +175,37 @@ struct Parsed {
     info: Info,
     sections: Vec<Section>,
     functions: Vec<Function>,
+    /// Statics repérées par la table de symboles (nom lisible, adresse, taille).
+    data_symbols: Vec<(String, u64, u64)>,
+    rules: Vec<Rule>,
+    rules_section: Option<(u64, u64)>,
+}
+
+/// Generates a `peek_*` / `poke_*` pair for one scalar type: read or write it
+/// at a raw address, with no name and no debug information needed.
+macro_rules! peek_poke {
+    ($peek:ident, $poke:ident, $prim:ty, $value_ctor:path, $variant:ident) => {
+        #[doc = concat!("Reads a `", stringify!($prim), "` at this address.")]
+        pub fn $peek(&self, address: u64) -> Result<$prim> {
+            let probe = $value_ctor(<$prim>::default());
+            let ty = probe.own_type();
+            let bytes = self.read_bytes(address, ty.size)?;
+            match Value::decode(bytes, &ty, self.endian())? {
+                Value::$variant(v) => Ok(v),
+                _ => unreachable!(),
+            }
+        }
+
+        #[doc = concat!(
+            "Writes a `", stringify!($prim), "` at this address (queued like every other edit)."
+        )]
+        pub fn $poke(&mut self, address: u64, value: $prim) -> Result<&mut Self> {
+            let value = $value_ctor(value);
+            let ty = value.own_type();
+            let bytes = value.encode(&ty, self.endian())?;
+            self.patch_bytes(address, &bytes)
+        }
+    };
 }
 
 impl Executable {
@@ -152,6 +228,8 @@ impl Executable {
         if require_rust && !parsed.info.is_rust {
             return Err(Error::NotRust(path.to_path_buf()));
         }
+        let (protections, guards) = build_guards(&parsed);
+        let data_symbols = parsed.data_symbols.clone();
         Ok(Executable {
             path: path.to_path_buf(),
             image,
@@ -163,6 +241,9 @@ impl Executable {
             backup: true,
             source_root: None,
             forced_mut: HashSet::new(),
+            protections,
+            guards,
+            data_symbols,
         })
     }
 
@@ -189,8 +270,12 @@ impl Executable {
     ///
     /// The list is empty for a stripped executable; [`function`](Self::function)
     /// then cannot be used, but byte-level patching still works.
-    pub fn functions(&self) -> &[Function] {
-        &self.functions
+    pub fn functions(&self) -> Vec<Function> {
+        self.functions
+            .iter()
+            .filter(|f| !f.file_offset.is_some_and(|o| self.is_hidden(o, f.size)))
+            .cloned()
+            .collect()
     }
 
     /// Statics and locals described by the DWARF debug information.
@@ -201,13 +286,17 @@ impl Executable {
         let debug = self.debug()?;
         let mut vars = Vec::new();
         for st in &debug.statics {
+            let file_offset = self.vaddr_to_offset(st.address);
+            if file_offset.is_some_and(|o| self.is_hidden(o, st.ty.size as u64)) {
+                continue;
+            }
             vars.push(Variable {
                 name: st.name.clone(),
                 ty: st.ty.name.clone(),
                 size: st.ty.size as u64,
                 kind: VariableKind::Static {
                     address: st.address,
-                    file_offset: self.vaddr_to_offset(st.address),
+                    file_offset,
                 },
             });
         }
@@ -238,6 +327,23 @@ impl Executable {
         parsed
             .as_ref()
             .map_err(|msg| Error::NoDebugInfo(msg.clone()))
+    }
+
+    /// Signature (return type, parameter types) of the function starting at
+    /// `address`, when the debug information describes it.
+    pub(crate) fn signature(
+        &self,
+        address: u64,
+    ) -> Option<(
+        Option<crate::value::ScalarType>,
+        Vec<crate::value::ScalarType>,
+    )> {
+        let debug = self.debug().ok()?;
+        let func = debug
+            .functions
+            .iter()
+            .find(|f| f.ranges.iter().any(|&(begin, _)| begin == address))?;
+        Some((func.ret.clone(), func.params.clone()))
     }
 
     pub(crate) fn endian(&self) -> Endian {
@@ -321,6 +427,60 @@ impl Executable {
         hits
     }
 
+    /// Finds a variable **by what it currently holds**, instead of by name.
+    ///
+    /// Works without any debug information, so it also works on a `release`
+    /// build: give the value you expect (for example `Value::i32(10)` for
+    /// `static LIMIT: i32 = 10;`), and every place in the loaded data that
+    /// holds exactly those bytes comes back, together with its symbol name
+    /// when the symbol table has one.
+    ///
+    /// Several places can share the same value — a genuinely coincidental
+    /// match in another constant, or several variables initialised the same
+    /// way. **Check `name` (or the surrounding section/address) before
+    /// writing to a match**: poking every match blindly, instead of the one
+    /// you meant, can corrupt unrelated data. A more distinctive value also
+    /// narrows the search down. See also
+    /// [`peek_i32`](Self::peek_i32) and friends to read a candidate back, and
+    /// [`poke_i32`](Self::poke_i32) and friends to write to one directly.
+    pub fn find_value(&self, value: impl Into<Value>) -> Vec<ValueMatch> {
+        let value = value.into();
+        let ty = value.own_type();
+        let Ok(bytes) = value.encode(&ty, self.endian()) else {
+            return Vec::new();
+        };
+        let mut matches = Vec::new();
+        for (base, data) in self.data_sections() {
+            for pos in memchr::memmem::find_iter(data, bytes.as_slice()) {
+                let address = base + pos as u64;
+                matches.push(ValueMatch {
+                    address,
+                    size: ty.size as u64,
+                    name: self.name_at(address, ty.size as u64),
+                });
+            }
+        }
+        matches
+    }
+
+    /// Best-effort name for the variable occupying `[address, address+size)`,
+    /// from the symbol table or, failing that, DWARF.
+    fn name_at(&self, address: u64, size: u64) -> Option<String> {
+        if let Some((name, _, _)) = self
+            .data_symbols
+            .iter()
+            .find(|(_, a, s)| *a == address && *s == size)
+        {
+            return Some(name.clone());
+        }
+        self.debug()
+            .ok()?
+            .statics
+            .iter()
+            .find(|s| s.address == address)
+            .map(|s| s.name.clone())
+    }
+
     /// Queues the replacement of every occurrence of `old` by `new`
     /// (same length), in the loaded sections only. Returns the number of
     /// occurrences found.
@@ -367,6 +527,25 @@ impl Executable {
         })
     }
 
+    /// Comme [`loaded_sections`](Self::loaded_sections), restreint aux
+    /// sections qui contiennent des *données de programme* (`.data`,
+    /// `.rodata`, `.data.rel.ro`). Exclut le code, les tables de relogement,
+    /// les métadonnées de déroulement d'exception (`.eh_frame*`) et le reste :
+    /// une recherche par contenu n'a aucune raison de tomber dessus, et y
+    /// trouver une correspondance ne serait qu'une coïncidence d'octets.
+    fn data_sections(&self) -> impl Iterator<Item = (u64, &[u8])> {
+        const NAMES: [&str; 3] = [".data", ".rodata", ".data.rel.ro"];
+        self.sections.iter().filter_map(move |s| {
+            if !NAMES.contains(&s.name.as_str()) || s.address == 0 {
+                return None;
+            }
+            let offset = s.file_offset?;
+            self.slice(offset, s.size)
+                .ok()
+                .map(|data| (s.address, data))
+        })
+    }
+
     // ------------------------------------------------------------------
     // Fonctions
     // ------------------------------------------------------------------
@@ -396,8 +575,19 @@ impl Executable {
             .iter()
             .filter(|f| f.name.ends_with(&suffix))
             .collect();
-        single("function", query, partial, |f| f.name.clone())?
-            .ok_or_else(|| Error::not_found("function", query))
+        if let Some(found) = single("function", query, partial, |f| f.name.clone())? {
+            return Ok(found);
+        }
+        if let Ok(debug) = self.debug() {
+            let hit = debug
+                .inlined_only
+                .iter()
+                .find(|name| name.as_str() == query || name.ends_with(&suffix));
+            if let Some(name) = hit {
+                return Err(Error::Inlined { name: name.clone() });
+            }
+        }
+        Err(Error::not_found("function", query))
     }
 
     // ------------------------------------------------------------------
@@ -544,6 +734,7 @@ impl Executable {
         new: Vec<u8>,
         description: String,
     ) -> Result<()> {
+        self.check_guards(file_offset, new.len() as u64)?;
         let old = self.slice(file_offset, new.len() as u64)?.to_vec();
         self.pending.push(Patch {
             file_offset,
@@ -552,6 +743,124 @@ impl Executable {
             new,
             description,
         })
+    }
+
+    /// Protection rules declared by the program (with `ruwrite::protect` /
+    /// `ruwrite::protect_all!`).
+    ///
+    /// A rule with `matches == 0` protects nothing in this build.
+    pub fn protections(&self) -> &[Protection] {
+        &self.protections
+    }
+
+    /// `true` when the program declares at least one protection rule.
+    pub fn is_protected(&self) -> bool {
+        !self.guards.is_empty()
+    }
+
+    /// `true` when `[start, start+len)` falls inside a part hidden with
+    /// `#[protect(hide)]`; used to leave it out of [`functions`](Self::functions)
+    /// and [`variables`](Self::variables).
+    fn is_hidden(&self, start: u64, len: u64) -> bool {
+        let end = start.saturating_add(len.max(1));
+        self.guards
+            .iter()
+            .any(|g| g.mode == ProtectionMode::Hidden && start < g.end && g.start < end)
+    }
+
+    /// Snapshot of the current bytes of every `#[protect(protected)]` part,
+    /// to compare against later with [`verify_integrity`](Self::verify_integrity).
+    ///
+    /// Take one right after building the release you intend to ship (before
+    /// it is signed or distributed) and keep it somewhere safe; it is plain
+    /// data, serialisable with any format you like if you add `serde` to it
+    /// yourself. The hash is not cryptographic — it only needs to catch
+    /// accidental or casual changes, not a determined attacker who also
+    /// controls the snapshot.
+    pub fn integrity_snapshot(&self) -> IntegritySnapshot {
+        let mut entries: Vec<(String, u64)> = self
+            .guards
+            .iter()
+            .filter(|g| g.mode == ProtectionMode::Protected)
+            .filter_map(|g| {
+                let bytes = self
+                    .slice(g.start, g.end.saturating_sub(g.start).min(1 << 24))
+                    .ok()?;
+                Some((
+                    format!("{}@{:#x}", g.what, g.start),
+                    protect::fnv1a64_bytes(bytes),
+                ))
+            })
+            .collect();
+        entries.sort();
+        IntegritySnapshot { entries }
+    }
+
+    /// Compares the current bytes of every `#[protect(protected)]` part
+    /// against a snapshot taken earlier with [`integrity_snapshot`](Self::integrity_snapshot).
+    ///
+    /// An empty result means nothing protected has changed. This only
+    /// catches a change to a *protected* part; parts declared `immutable` or
+    /// left unprotected are not covered (use `protected` for anything you
+    /// want checked this way).
+    pub fn verify_integrity(&self, snapshot: &IntegritySnapshot) -> Vec<IntegrityViolation> {
+        let current = self.integrity_snapshot();
+        let mut violations = Vec::new();
+        for (what, old_hash) in &snapshot.entries {
+            match current.entries.iter().find(|(w, _)| w == what) {
+                None => violations.push(IntegrityViolation {
+                    what: what.clone(),
+                    kind: IntegrityIssue::Missing,
+                }),
+                Some((_, new_hash)) if new_hash != old_hash => {
+                    violations.push(IntegrityViolation {
+                        what: what.clone(),
+                        kind: IntegrityIssue::Changed,
+                    })
+                }
+                Some(_) => {}
+            }
+        }
+        for (what, _) in &current.entries {
+            if !snapshot.entries.iter().any(|(w, _)| w == what) {
+                violations.push(IntegrityViolation {
+                    what: what.clone(),
+                    kind: IntegrityIssue::New,
+                });
+            }
+        }
+        violations
+    }
+
+    /// Refuses a byte range that overlaps something the program protects.
+    ///
+    /// When the program protects anything, bytes outside every section (file
+    /// headers, section table) are refused too: they could be used to remove
+    /// the protection records.
+    pub(crate) fn check_guards(&self, offset: u64, len: u64) -> Result<()> {
+        if self.guards.is_empty() {
+            return Ok(());
+        }
+        let end = offset.saturating_add(len);
+        if let Some(guard) = self.guards.iter().find(|g| offset < g.end && g.start < end) {
+            return Err(Error::Protected {
+                what: guard.what.clone(),
+                rule: guard.rule.clone(),
+            });
+        }
+        let in_section = self.sections.iter().any(|s| {
+            s.file_offset
+                .is_some_and(|start| offset >= start && end <= start + s.size)
+        });
+        if !in_section {
+            return Err(Error::Protected {
+                what: format!("file structure at offset {offset:#x}"),
+                rule:
+                    "the program declares protected parts, so the file structure is protected too"
+                        .into(),
+            });
+        }
+        Ok(())
     }
 
     /// Edits waiting for a `commit`.
@@ -601,6 +910,25 @@ impl Executable {
     }
 
     // ------------------------------------------------------------------
+    // peek / poke — direct, typed access by address, no name needed
+    // ------------------------------------------------------------------
+    //
+    // These work on any build, with or without DWARF: pair them with
+    // `find_value` to locate an address first. `set_static` stays the way to
+    // go when the variable has a name and the executable has debug info.
+    peek_poke!(peek_bool, poke_bool, bool, Value::Bool, Bool);
+    peek_poke!(peek_i8, poke_i8, i8, Value::I8, I8);
+    peek_poke!(peek_i16, poke_i16, i16, Value::I16, I16);
+    peek_poke!(peek_i32, poke_i32, i32, Value::I32, I32);
+    peek_poke!(peek_i64, poke_i64, i64, Value::I64, I64);
+    peek_poke!(peek_u8, poke_u8, u8, Value::U8, U8);
+    peek_poke!(peek_u16, poke_u16, u16, Value::U16, U16);
+    peek_poke!(peek_u32, poke_u32, u32, Value::U32, U32);
+    peek_poke!(peek_u64, poke_u64, u64, Value::U64, U64);
+    peek_poke!(peek_f32, poke_f32, f32, Value::F32, F32);
+    peek_poke!(peek_f64, poke_f64, f64, Value::F64, F64);
+
+    // ------------------------------------------------------------------
     // Validation
     // ------------------------------------------------------------------
 
@@ -640,6 +968,9 @@ impl Executable {
         } else {
             self.image.clone()
         };
+        for patch in self.pending.as_slice() {
+            self.check_guards(patch.file_offset, patch.new.len() as u64)?;
+        }
         let patches = self.pending.as_slice().len();
         let bytes = self.pending.apply(&mut image)?;
 
@@ -673,7 +1004,10 @@ impl Executable {
     /// is not executing at that very moment (functions that are called, not
     /// the one currently on the stack).
     pub fn commit_hot(&mut self, pid: u32) -> Result<CommitReport> {
-        let written = live::apply(pid, self.pending.as_slice())?;
+        for patch in self.pending.as_slice() {
+            self.check_guards(patch.file_offset, patch.new.len() as u64)?;
+        }
+        let written = live::apply(&self.image, pid, self.pending.as_slice())?;
         let bytes = self
             .pending
             .as_slice()
@@ -789,11 +1123,20 @@ fn parse(image: &[u8]) -> Result<Parsed> {
         .collect();
 
     let mut functions = Vec::new();
+    let mut data_symbols = Vec::new();
     let mut rust_symbols = false;
     for symbol in file.symbols().chain(file.dynamic_symbols()) {
         let Ok(mangled) = symbol.name() else { continue };
         if rustc_demangle::try_demangle(mangled).is_ok() {
             rust_symbols = true;
+        }
+        if symbol.kind() == SymbolKind::Data && symbol.size() > 0 && symbol.address() != 0 {
+            data_symbols.push((
+                format!("{:#}", rustc_demangle::demangle(mangled)),
+                symbol.address(),
+                symbol.size(),
+            ));
+            continue;
         }
         if symbol.kind() != SymbolKind::Text || symbol.size() == 0 || symbol.address() == 0 {
             continue;
@@ -828,10 +1171,14 @@ fn parse(image: &[u8]) -> Result<Parsed> {
         has_debug_info: file.has_debug_symbols(),
     };
 
+    let (rules, rules_section) = protect::read_rules(&file);
     let mut parsed = Parsed {
         info,
         sections,
         functions,
+        data_symbols,
+        rules,
+        rules_section,
     };
     // Les décalages dans le fichier se déduisent des sections.
     let offsets: Vec<Option<u64>> = parsed
@@ -859,4 +1206,138 @@ fn has_rust_markers(image: &[u8]) -> bool {
     MARKERS
         .iter()
         .any(|m| memchr::memmem::find(image, m).is_some())
+}
+
+/// Transforme les règles déclarées par le programme en plages d'octets.
+fn build_guards(parsed: &Parsed) -> (Vec<Protection>, Vec<Guard>) {
+    let mut protections = Vec::new();
+    let mut guards = Vec::new();
+    if parsed.rules.is_empty() {
+        return (protections, guards);
+    }
+
+    // La section qui porte les règles est elle-même protégée.
+    if let Some((start, end)) = parsed.rules_section {
+        guards.push(Guard {
+            start,
+            end,
+            what: "the protection records".into(),
+            rule: "they define what is protected".into(),
+            mode: ProtectionMode::Immutable,
+        });
+    }
+
+    // Sans table de symboles (exécutable strippé), les noms déclarés ne
+    // peuvent pas être retrouvés : on verrouille tout plutôt que de laisser
+    // croire que la protection s'applique.
+    let unresolvable = parsed.functions.is_empty() && parsed.data_symbols.is_empty();
+    let locks_something = parsed
+        .rules
+        .iter()
+        .any(|r| r.mode != ProtectionMode::Editable);
+    if unresolvable && locks_something {
+        guards.push(Guard {
+            start: 0,
+            end: u64::MAX,
+            what: "the executable".into(),
+            rule: "it declares protected parts but has no symbol table (stripped), \
+                   so they cannot be located: everything is protected"
+                .into(),
+            mode: ProtectionMode::Immutable,
+        });
+    }
+
+    for rule in &parsed.rules {
+        let locks = rule.mode != ProtectionMode::Editable;
+        let mode = rule.mode;
+        let mut matches = 0;
+        let mut record = |target, start: u64, end: u64, what: String| {
+            matches += 1;
+            if locks {
+                guards.push(Guard {
+                    start,
+                    end,
+                    what,
+                    rule: format!("{target} ({mode})"),
+                    mode,
+                });
+            }
+        };
+
+        let target = match &rule.target {
+            RawTarget::Everything => {
+                record(
+                    ProtectionTarget::Everything.to_string(),
+                    0,
+                    u64::MAX,
+                    "the executable".into(),
+                );
+                ProtectionTarget::Everything
+            }
+            RawTarget::Function(pattern) => {
+                for f in &parsed.functions {
+                    if let (true, Some(start)) =
+                        (protect::name_matches(&f.name, pattern), f.file_offset)
+                    {
+                        record(
+                            ProtectionTarget::Function(pattern.clone()).to_string(),
+                            start,
+                            start + f.size,
+                            format!("function `{}`", f.name),
+                        );
+                    }
+                }
+                ProtectionTarget::Function(pattern.clone())
+            }
+            RawTarget::Static(pattern) => {
+                for (name, address, size) in &parsed.data_symbols {
+                    if !protect::name_matches(name, pattern) {
+                        continue;
+                    }
+                    if let Some(start) = section_offset(&parsed.sections, *address) {
+                        record(
+                            ProtectionTarget::Static(pattern.clone()).to_string(),
+                            start,
+                            start + size,
+                            format!("static `{name}`"),
+                        );
+                    }
+                }
+                ProtectionTarget::Static(pattern.clone())
+            }
+            RawTarget::HiddenName(hash) => {
+                for f in &parsed.functions {
+                    if protect::fnv1a64(protect::last_segment(&f.name)) == *hash {
+                        if let Some(start) = f.file_offset {
+                            record(
+                                "a hidden function".into(),
+                                start,
+                                start + f.size,
+                                "a hidden function".into(),
+                            );
+                        }
+                    }
+                }
+                for (name, address, size) in &parsed.data_symbols {
+                    if protect::fnv1a64(protect::last_segment(name)) == *hash {
+                        if let Some(start) = section_offset(&parsed.sections, *address) {
+                            record(
+                                "a hidden static".into(),
+                                start,
+                                start + size,
+                                "a hidden static".into(),
+                            );
+                        }
+                    }
+                }
+                ProtectionTarget::HiddenName(*hash)
+            }
+        };
+        protections.push(Protection {
+            target,
+            mode: rule.mode,
+            matches,
+        });
+    }
+    (protections, guards)
 }

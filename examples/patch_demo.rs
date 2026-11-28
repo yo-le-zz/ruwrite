@@ -11,7 +11,7 @@
 use std::path::Path;
 use std::process::Command;
 
-use ruwrite::Executable;
+use ruwrite::{Executable, Value};
 
 fn run(path: &Path) -> String {
     let out = Command::new(path).output().expect("cannot run the target");
@@ -29,8 +29,8 @@ fn main() -> ruwrite::Result<()> {
     // `exe` designates the target executable; nothing is modified yet.
     let mut exe = Executable::open(&original)?;
 
-    exe.set_static("LIMIT", 100)?; // static LIMIT: i32 = 10
-    exe.local("compute", "a")?.set(2u8)?; // let a: i32 = 3  ->  2
+    exe.set_static("LIMIT", Value::i32(100))?; // static LIMIT: i32 = 10
+    exe.local("compute", "a")?.set(Value::u8(2))?; // let a: i32 = 3  ->  2
     exe.function("is_admin")?.returns(true)?; // always true
     exe.function("say_hi")?.disable()?; // does nothing any more
 

@@ -9,10 +9,11 @@ use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
-use ruwrite::{Error, Executable, Mutability, Value};
+use ruwrite::{Error, Executable, Mutability, ProtectionMode, ProtectionTarget, Value};
 
 const TARGET: &str = env!("CARGO_BIN_EXE_target_demo");
 const HOT: &str = env!("CARGO_BIN_EXE_hot_demo");
+const LOCKED: &str = env!("CARGO_BIN_EXE_locked_demo");
 
 /// Copie privée d'un exécutable, supprimée en fin de test.
 struct Copy {
@@ -201,8 +202,6 @@ fn rewrites_functions() {
 fn too_large_code_is_refused() {
     let t = Copy::of(TARGET);
     let mut exe = t.open();
-    let err = exe.function("is_admin").unwrap().returns(u64::MAX);
-    assert!(matches!(err, Err(Error::FunctionTooSmall { .. })));
     let err = exe.function("is_admin").unwrap().replace_code(&[0x90; 64]);
     assert!(matches!(err, Err(Error::FunctionTooSmall { .. })));
 }
@@ -437,4 +436,400 @@ fn inserts_an_assignment_into_freed_space() {
     let mut exe = t.open();
     let err = exe.local("counter", "fixed").unwrap().assign_at(address, 1);
     assert!(matches!(err, Err(Error::NotMutable { .. })));
+}
+
+fn assert_protected<T: std::fmt::Debug>(result: Result<T, Error>) {
+    match result {
+        Err(Error::Protected { .. }) => {}
+        other => panic!("expected a protection error, got {other:?}"),
+    }
+}
+
+#[test]
+fn protection_rules_are_read_from_the_binary() {
+    let t = Copy::of(TARGET);
+    let exe = t.open();
+    assert!(exe.is_protected());
+    let rules = exe.protections();
+    assert_eq!(rules.len(), 4);
+    assert!(rules.iter().any(
+        |p| p.target == ProtectionTarget::Function("license_check".into())
+            && p.mode == ProtectionMode::Immutable
+            && p.matches == 1
+    ));
+    assert!(rules
+        .iter()
+        .any(|p| p.target == ProtectionTarget::Function("token".into())
+            && p.mode == ProtectionMode::Immutable
+            && p.matches == 1));
+    assert!(rules
+        .iter()
+        .any(|p| p.target == ProtectionTarget::Static("SECRET".into())
+            && p.mode == ProtectionMode::Protected
+            && p.matches == 1));
+    assert!(rules
+        .iter()
+        .any(|p| matches!(p.target, ProtectionTarget::HiddenName(_))
+            && p.mode == ProtectionMode::Hidden
+            && p.matches == 1));
+}
+
+#[test]
+fn hidden_function_is_left_out_of_listings_but_still_runs() {
+    let t = Copy::of(TARGET);
+    let exe = t.open();
+    assert!(!exe
+        .functions()
+        .iter()
+        .any(|f| f.name.contains("hidden_formula")));
+    assert_eq!(t.run()["hidden"], "7");
+}
+
+#[test]
+fn integrity_snapshot_catches_a_change_to_a_protected_part() {
+    let t = Copy::of(TARGET);
+    let exe = t.open();
+    let snapshot = exe.integrity_snapshot();
+    assert!(exe.verify_integrity(&snapshot).is_empty());
+
+    // La seule façon de faire bouger la valeur protégée ici est de copier un
+    // fichier déjà différent : on simule une modification externe à ruwrite
+    // en comparant plus tard l'instantané pris sur l'original avec celui
+    // d'une version patchée ailleurs (LIMIT n'est pas protégé, donc le patch
+    // passe par commit_to normalement puis on falsifie `SECRET` à la main).
+    let patched = t.path.with_file_name("tampered");
+    std::fs::copy(&t.path, &patched).unwrap();
+    let mut raw = std::fs::read(&patched).unwrap();
+    let secret_addr = exe
+        .find_value(Value::i32(1234))
+        .into_iter()
+        .find(|m| m.name.as_deref() == Some("target_demo::SECRET"))
+        .unwrap()
+        .address;
+    let offset = exe.vaddr_to_offset(secret_addr).unwrap() as usize;
+    raw[offset] = 0xFF; // modification faite hors de ruwrite
+    std::fs::write(&patched, &raw).unwrap();
+
+    let tampered_exe = Executable::open(&patched).unwrap();
+    let violations = tampered_exe.verify_integrity(&snapshot);
+    assert!(
+        violations
+            .iter()
+            .any(|v| v.what.contains("SECRET") && v.kind == ruwrite::IntegrityIssue::Changed),
+        "{violations:?}"
+    );
+}
+
+#[test]
+fn protected_function_and_static_cannot_be_edited() {
+    let t = Copy::of(TARGET);
+    let mut exe = t.open();
+    assert_protected(exe.function("license_check").unwrap().returns(true));
+    assert_protected(exe.function("license_check").unwrap().disable());
+    assert_protected(exe.function("secure::token").unwrap().returns(1));
+    assert_protected(exe.set_static("SECRET", 1));
+    assert_protected(exe.set_static_bytes("SECRET", &[0; 4]));
+    assert!(exe.pending().is_empty());
+
+    let message = exe.set_static("SECRET", 1).unwrap_err().to_string();
+    assert!(message.contains("sensitive and protected"), "{message}");
+    assert!(message.contains("SECRET"), "{message}");
+}
+
+#[test]
+fn raw_patches_cannot_bypass_the_protection() {
+    let t = Copy::of(TARGET);
+    let mut exe = t.open();
+    let function = exe
+        .functions()
+        .iter()
+        .find(|f| f.name == "target_demo::license_check")
+        .unwrap()
+        .clone();
+    // Par adresse virtuelle, par décalage dans le fichier, en rognant un octet.
+    assert_protected(exe.patch_bytes(function.address, &[0x90]));
+    assert_protected(exe.patch_bytes(function.address + 1, &[0x90]));
+    assert_protected(exe.nop(function.address, 2));
+    assert_protected(exe.patch_file_bytes(function.file_offset.unwrap(), &[0x90]));
+    // Les sections qui portent les règles et l'en-tête du fichier aussi.
+    let records = exe
+        .sections()
+        .iter()
+        .find(|s| s.name == ".ruwprot")
+        .unwrap()
+        .clone();
+    assert_protected(exe.patch_file_bytes(records.file_offset.unwrap(), &[0]));
+    assert_protected(exe.patch_file_bytes(0, &[0]));
+    // Un remplacement de motif qui toucherait une partie protégée échoue aussi.
+    assert_protected(exe.replace_bytes(b"RUWPROT2", b"XXXXXXXX"));
+    assert!(exe.pending().is_empty());
+}
+
+#[test]
+fn unprotected_parts_of_a_protected_program_stay_editable() {
+    let t = Copy::of(TARGET);
+    let mut exe = t.open();
+    exe.set_static("LIMIT", 77).unwrap();
+    exe.function("is_admin").unwrap().returns(true).unwrap();
+    exe.commit().unwrap();
+    let out = t.run();
+    assert_eq!(out["limit"], "77");
+    assert_eq!(out["admin"], "true");
+    // Les parties protégées n'ont pas bougé.
+    assert_eq!(out["license"], "false");
+    assert_eq!(out["secret"], "1234");
+    assert_eq!(out["token"], "99");
+}
+
+#[test]
+fn protection_applies_to_every_commit_mode() {
+    let t = Copy::of(TARGET);
+    let mut exe = t.open();
+    assert_protected(exe.function("license_check").unwrap().returns(true));
+    // Rien n'est en file d'attente : commit_to et commit_hot n'ont rien à écrire.
+    let copy = t.path.with_file_name("copy");
+    assert_eq!(exe.commit_to(&copy).unwrap().patches, 0);
+    assert!(!copy.exists());
+}
+
+#[test]
+fn protect_all_refuses_everything() {
+    let t = Copy::of(LOCKED);
+    let mut exe = t.open();
+    assert!(exe
+        .protections()
+        .iter()
+        .any(|p| p.target == ProtectionTarget::Everything));
+    assert_protected(exe.function("answer").unwrap().returns(1));
+    assert_protected(exe.set_static("VALUE", 1));
+    assert_protected(exe.patch_file_bytes(0x1000, &[0]));
+    assert_protected(exe.replace_bytes(b"value=", b"VALUE="));
+    assert_eq!(t.run()["answer"], "42");
+}
+
+#[test]
+fn unprotected_programs_report_no_rules() {
+    let t = Copy::of(HOT);
+    let exe = t.open();
+    assert!(!exe.is_protected());
+    assert!(exe.protections().is_empty());
+}
+
+#[test]
+fn compiler_style_checks_on_functions() {
+    let t = Copy::of(TARGET);
+    let mut exe = t.open();
+    // Mauvais type de valeur pour le type de retour.
+    assert!(matches!(
+        exe.function("compute").unwrap().returns(true),
+        Err(Error::TypeMismatch { .. })
+    ));
+    assert!(matches!(
+        exe.function("compute").unwrap().returns(1.5f64),
+        Err(Error::TypeMismatch { .. })
+    ));
+    assert!(matches!(
+        exe.function("is_admin").unwrap().returns(1),
+        Err(Error::TypeMismatch { .. })
+    ));
+    // Valeur hors limites du type de retour (i32).
+    assert!(matches!(
+        exe.function("compute").unwrap().returns(1i64 << 40),
+        Err(Error::ValueOutOfRange { .. })
+    ));
+    // `()` ne peut rien renvoyer ; une fonction typée ne peut pas être désactivée.
+    assert!(matches!(
+        exe.function("say_hi").unwrap().returns(1),
+        Err(Error::Rejected(_))
+    ));
+    assert!(matches!(
+        exe.function("compute").unwrap().disable(),
+        Err(Error::Rejected(_))
+    ));
+    // Redirection entre signatures différentes.
+    assert!(matches!(
+        exe.function("redirected").unwrap().redirect_to("say_hi"),
+        Err(Error::Rejected(_))
+    ));
+    assert!(exe.pending().is_empty());
+
+    // Une valeur de type voisin est convertie vers le type déclaré.
+    exe.function("compute")
+        .unwrap()
+        .returns(-7i64 as i32)
+        .unwrap();
+    exe.commit().unwrap();
+    assert_eq!(t.run()["compute"], "-7");
+}
+
+#[test]
+fn stripped_protected_executables_are_fully_locked() {
+    // Retire la table de symboles : les noms protégés ne peuvent plus être
+    // localisés, donc rien ne doit pouvoir être modifié.
+    let t = Copy::of(TARGET);
+    let status = Command::new("strip").arg(&t.path).status();
+    let Ok(status) = status else { return }; // `strip` absent : test sans objet
+    assert!(status.success());
+    let mut exe = t.open();
+    assert!(exe.is_protected());
+    assert!(exe.functions().is_empty());
+    assert_protected(exe.patch_file_bytes(0x1000, &[0]));
+    let sections = exe.sections().to_vec();
+    let text = sections.iter().find(|s| s.name == ".text").unwrap();
+    assert_protected(exe.patch_bytes(text.address, &[0x90]));
+    let message = exe
+        .patch_bytes(text.address, &[0x90])
+        .unwrap_err()
+        .to_string();
+    assert!(message.contains("stripped"), "{message}");
+}
+
+#[test]
+fn finds_and_edits_a_static_without_debug_info() {
+    // Simule un build release : aucune information DWARF n'est utilisée ici.
+    let t = Copy::of(TARGET);
+    let mut exe = t.open();
+    let matches = exe.find_value(Value::i32(10));
+    let target = matches
+        .iter()
+        .find(|m| m.name.as_deref() == Some("target_demo::LIMIT"))
+        .expect("LIMIT should be found by its content");
+    assert_eq!(exe.peek_i32(target.address).unwrap(), 10);
+    exe.poke_i32(target.address, 55).unwrap();
+    exe.commit().unwrap();
+    assert_eq!(t.run()["limit"], "55");
+}
+
+#[test]
+fn peek_and_poke_round_trip_every_scalar_kind() {
+    let t = Copy::of(TARGET);
+    let mut exe = t.open();
+    let addr = exe.static_bytes("LIMIT").ok().and(None::<u64>); // garde le type inféré
+    let _ = addr;
+    let a = exe
+        .find_value(Value::i32(10))
+        .into_iter()
+        .find(|m| m.name.as_deref() == Some("target_demo::LIMIT"))
+        .unwrap()
+        .address;
+    exe.poke_i32(a, -7).unwrap();
+    assert_eq!(
+        exe.peek_i32(a).unwrap(),
+        10,
+        "poke is queued, not applied until commit"
+    );
+
+    let b = exe
+        .find_value(Value::u8(7))
+        .into_iter()
+        .find(|m| m.name.as_deref() == Some("target_demo::SMALL"))
+        .unwrap()
+        .address;
+    exe.poke_u8(b, 250).unwrap();
+
+    let c = exe
+        .find_value(Value::f64(1.5))
+        .into_iter()
+        .find(|m| m.name.as_deref() == Some("target_demo::RATIO"))
+        .unwrap()
+        .address;
+    exe.poke_f64(c, 9.5).unwrap();
+
+    exe.commit().unwrap();
+    assert_eq!(exe.peek_i32(a).unwrap(), -7);
+    assert_eq!(exe.peek_u8(b).unwrap(), 250);
+    assert_eq!(exe.peek_f64(c).unwrap(), 9.5);
+}
+
+/// Compiles a tiny, optimised, standalone program so `helper` gets fully
+/// inlined into `main` (no `#[inline(never)]`), then checks that looking it
+/// up names the real problem instead of a plain "not found".
+#[test]
+fn inlined_function_reports_a_friendlier_error() {
+    let dir = std::env::temp_dir().join(format!(
+        "ruwrite-inline-probe-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    fs::create_dir_all(&dir).unwrap();
+    let src = dir.join("inline_probe.rs");
+    fs::write(
+        &src,
+        r#"
+        #[inline]
+        fn helper(x: i32) -> i32 {
+            x.wrapping_add(1)
+        }
+
+        fn main() {
+            println!("{}", std::hint::black_box(helper(std::hint::black_box(41))));
+        }
+        "#,
+    )
+    .unwrap();
+    let bin = dir.join(if cfg!(windows) {
+        "inline_probe.exe"
+    } else {
+        "inline_probe"
+    });
+    let status = Command::new("rustc")
+        .args(["-O", "-C", "debuginfo=2", "-o"])
+        .arg(&bin)
+        .arg(&src)
+        .status()
+        .expect("rustc should be on PATH");
+    assert!(status.success(), "rustc failed to build the probe");
+
+    let mut exe = Executable::open(&bin).expect("the probe is a debug-info-bearing Rust binary");
+    match exe.function("helper") {
+        Err(Error::Inlined { name }) => assert!(name.ends_with("helper"), "{name}"),
+        Ok(_) => panic!("expected Error::Inlined, got Ok"),
+        Err(other) => panic!("expected Error::Inlined, got {other}"),
+    }
+
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// `cascade_check(x)` compares `a` (set to `x`) against `5` with a signed
+/// `jl`, so `cascade_check(-100)` returns `1` (`-100 < 5` is true for a
+/// signed reading). Cascade mode, triggered by writing an unsigned value to
+/// the (declared signed) `a`, flips that `jl` to the unsigned `jb`: the same
+/// bit pattern read as unsigned is a huge number, no longer "below" `5`, so
+/// the patched binary returns `2` instead for the same input.
+#[test]
+fn cascade_mode_flips_a_comparison_to_match_a_retyped_variable() {
+    let t = Copy::of(TARGET);
+    assert_eq!(t.run()["cascade"], "1");
+
+    let mut exe = t.open();
+    exe.local("cascade_check", "a")
+        .unwrap()
+        .cascade()
+        .set(Value::u8(200))
+        .unwrap();
+    exe.commit().unwrap();
+
+    assert_eq!(t.run()["cascade"], "2");
+}
+
+#[test]
+fn value_matches_stay_within_data_like_sections() {
+    let t = Copy::of(TARGET);
+    let exe = t.open();
+    let text = exe
+        .sections()
+        .iter()
+        .find(|s| s.name == ".text")
+        .unwrap()
+        .clone();
+    for m in exe.find_value(Value::i32(10)) {
+        assert!(
+            !(text.address..text.address + text.size).contains(&m.address),
+            "a value match landed inside .text at {:#x}",
+            m.address
+        );
+    }
 }

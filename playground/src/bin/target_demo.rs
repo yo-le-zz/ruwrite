@@ -3,12 +3,39 @@
 //! Construit en debug (opt-level 0, informations DWARF), il affiche une ligne
 //! `clé=valeur` par élément, ce qui permet de vérifier chaque réécriture.
 
+use ruwrite::protect;
 use std::hint::black_box;
 
 static LIMIT: i32 = 10;
 static RATIO: f64 = 1.5;
 static BANNER: [u8; 5] = *b"hello";
 static SMALL: u8 = 7;
+
+#[protect(protected)]
+static SECRET: i32 = 1234;
+
+#[protect(immutable)]
+#[inline(never)]
+fn license_check() -> bool {
+    false
+}
+
+mod secure {
+    use ruwrite::protect;
+
+    #[protect(immutable)]
+    #[inline(never)]
+    pub fn token() -> i32 {
+        99
+    }
+}
+
+// Caché : ni le nom ni la liste des fonctions de ruwrite ne la montrent.
+#[protect(hide)]
+#[inline(never)]
+fn hidden_formula() -> i32 {
+    7
+}
 
 #[inline(never)]
 fn compute() -> i32 {
@@ -41,6 +68,22 @@ fn is_admin() -> bool {
     false
 }
 
+/// `a`'s initial value is overwritten by `x` before the comparison, which
+/// keeps `a` in its stack slot and the `a < 5` test compiled as a direct
+/// `cmp [slot], 5` (no constant folding, no register in between): exactly
+/// the shape cascade mode looks for.
+#[inline(never)]
+#[allow(unused_assignments)]
+fn cascade_check(x: i32) -> i32 {
+    let mut a: i32 = 3;
+    a = x;
+    if a < 5 {
+        1
+    } else {
+        2
+    }
+}
+
 #[inline(never)]
 fn scale() -> f64 {
     let factor: f64 = 1.0;
@@ -68,6 +111,9 @@ fn redirected() -> i32 {
 }
 
 fn main() {
+    println!("license={}", license_check());
+    println!("secret={}", black_box(&SECRET));
+    println!("token={}", secure::token());
     println!("limit={}", black_box(&LIMIT));
     println!("ratio={}", black_box(&RATIO));
     println!("banner={}", String::from_utf8_lossy(black_box(&BANNER)));
@@ -79,6 +125,8 @@ fn main() {
     println!("scale={}", scale());
     say_hi();
     println!("redirected={}", redirected());
+    println!("hidden={}", hidden_formula());
+    println!("cascade={}", cascade_check(black_box(-100)));
     // Garde `replacement` dans le binaire.
     black_box(replacement as fn() -> i32);
 }

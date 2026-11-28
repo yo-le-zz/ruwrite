@@ -1,6 +1,6 @@
 [package]
 name = "ruwrite-playground"
-version = "0.2.0"
+version = "0.4.0"
 edition = "2021"
 authors = ["yolezz"]
 description = "Target programs and end-to-end tests for ruwrite."

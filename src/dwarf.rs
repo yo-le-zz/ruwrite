@@ -48,6 +48,10 @@ pub struct DwFunction {
     /// Address ranges of the machine code (usually exactly one).
     pub ranges: Vec<(u64, u64)>,
     pub locals: Vec<DwLocal>,
+    /// Return type, `None` for `()`.
+    pub ret: Option<ScalarType>,
+    /// Types of the parameters, in order.
+    pub params: Vec<ScalarType>,
 }
 
 /// A variable with a fixed address (`static`, `static mut`).
@@ -71,6 +75,10 @@ struct LineRow {
 pub struct DebugInfo {
     pub functions: Vec<DwFunction>,
     pub statics: Vec<DwStatic>,
+    /// Qualified names of functions the compiler fully inlined: a
+    /// `DW_TAG_subprogram` exists (so the source-level name is known) but it
+    /// has no address range of its own, only inlined copies at call sites.
+    pub inlined_only: Vec<String>,
     lines: Vec<LineRow>,
 }
 
@@ -161,6 +169,10 @@ fn read_unit<'a>(dwarf: &Dwarf<'a>, unit: &Unit<'a>, info: &mut DebugInfo) -> gi
                 read_variable(dwarf, unit, entry, &stack, info)?;
                 Scope::Other
             }
+            gimli::DW_TAG_formal_parameter => {
+                read_parameter(dwarf, unit, entry, &stack, info)?;
+                Scope::Other
+            }
             _ => Scope::Other,
         };
 
@@ -218,16 +230,27 @@ fn read_function<'a>(
             ranges.push((range.begin, range.end));
         }
     }
-    // Sans code (déclaration, fonction éliminée) : rien à enregistrer.
-    if ranges.is_empty() || name.is_empty() {
+    // Sans code (déclaration, fonction éliminée, ou entièrement « inlinée ») :
+    // rien à patcher, mais `DW_AT_inline` permet de distinguer le cas où le
+    // compilateur a quand même gardé le nom pour chaque copie en ligne.
+    if ranges.is_empty() {
+        if !name.is_empty() && entry.attr_value(gimli::DW_AT_inline).is_some() {
+            info.inlined_only.push(qualified(stack, &name));
+        }
         return Ok(Scope::Function(None, name));
     }
 
+    let ret = match entry.attr_value(gimli::DW_AT_type) {
+        Some(_) => Some(describe_type(dwarf, unit, entry)?),
+        None => None,
+    };
     info.functions.push(DwFunction {
         name: qualified(stack, &name),
         frame_base: frame_base(unit, entry)?,
         ranges,
         locals: Vec::new(),
+        ret,
+        params: Vec::new(),
     });
     Ok(Scope::Function(Some(info.functions.len() - 1), name))
 }
@@ -472,4 +495,23 @@ fn declaration_file<'a>(
     }
     path.push_str(&name);
     Ok(Some(path))
+}
+
+/// Paramètre formel : ajouté au type de signature de la fonction englobante.
+fn read_parameter<'a>(
+    dwarf: &Dwarf<'a>,
+    unit: &Unit<'a>,
+    entry: &Entry<'a>,
+    stack: &[Frame],
+    info: &mut DebugInfo,
+) -> gimli::Result<()> {
+    let owner = stack.iter().rev().find_map(|f| match f.scope {
+        Scope::Function(idx, _) => Some(idx),
+        _ => None,
+    });
+    if let Some(Some(idx)) = owner {
+        let ty = describe_type(dwarf, unit, entry)?;
+        info.functions[idx].params.push(ty);
+    }
+    Ok(())
 }
